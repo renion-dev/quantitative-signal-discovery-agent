@@ -1,3 +1,4 @@
+cd /home/ihor/projects/nvidia-quant-signal && pkill -f "uvicorn dashboard.app" 2>/dev/null; sleep 1; .venv/bin/python -m uvicorn dashboard.app:app --host 0.0.0.0 --port 8090
 # Quantitative Signal Discovery Agent developer example
 
 An end-to-end signal discovery workflow for quantitative finance using NVIDIA NeMo Agent Toolkit. This workflow demonstrates how to leverage LLMs to automatically generate, code, and evaluate alpha signals.
@@ -296,11 +297,176 @@ quantitative-signal-discovery-agent/
 └── tests/                                          # pytest suite
 ```
 
+## Extended Capabilities
+
+The workflow now includes optional performance, safety, research, and observability features. Optional acceleration and validation switches are off by default; `save_evolution` is enabled in the shipped configurations.
+
+| Capability | Implemented behavior |
+|------------|----------------------|
+| Multi-asset data | Registers S&P 500, Nasdaq-100, sector ETFs, major forex, spot crypto, Binance perpetual futures, fundamentals, and sentiment presets. The generic downloader writes evaluator-compatible field CSVs plus a manifest. |
+| Portfolio analytics | Builds a date-by-stock, equal-weight long/short portfolio from each signal and adds Sharpe, Sortino, drawdown, CAGR, volatility, and turnover metrics to the evaluation result. |
+| Out-of-sample validation | Splits aligned dates chronologically into in-sample and out-of-sample sets, reports both IC results, and can prevent acceptance when the result is classified as overfit. |
+| Parallel generation | Issues one hypothesis-generation LLM call per requested signal, bounded by a concurrency semaphore, and combines the results in request order. |
+| Genetic crossover | Selects high-`|IC|` evaluated parents, asks the signal LLM for one combined hypothesis, and carries that candidate into the next iteration. |
+| Skeptic gate | Reviews candidates before backtesting. Deterministic lookahead, leakage, degenerate-logic, and unknown-operator findings can veto a candidate; an optional LLM can also issue a `reject` verdict. Case-insensitive operator matching yields an advisory `operator_case:` for case-only mismatches, while genuinely unknown operators still veto. |
+| Evolution tracking | Assigns a run ID and records the request, iteration, parent signal, and lineage source in every saved iteration so the dashboard can build a run tree. |
+| Sandboxed execution | Optionally validates generated Python with AST rules and executes it in a restricted namespace. A subprocess API with CPU, memory, and wall-clock limits is also available. |
+| GPU Rank IC | Optionally delegates rank-IC computation to CuPy or PyTorch, with automatic CPU fallback when no usable accelerator is present. |
+| Operator memoization | Optionally reuses identical operator results across candidate modules with content- and implementation-aware cache keys. |
+
+Measured with the production `extract_json_array` extraction path over the 9,374 saved artifacts (18,665 candidate occurrences with a formula), the reconstructed pre-change gate blocked 1,223 candidates (6.55%); the current gate blocks 930 (4.98%), recovering 293. The change reclassified 334 case-only operator findings (across 321 candidate occurrences) from blocking to advisory — 28 of those candidates stay blocked for another reason — while all 956 genuine unknown-operator findings (across 928 candidate occurrences) remain blocking, with none lost. The rate is per candidate occurrence across repeated optimization runs, not per distinct signal concept: deduplicating by name (3,250 distinct names) would conflate 245 names that received different verdicts in different iterations. Case mismatches resolve to the candidate's self-contained helper (correct result) or raise an explicit backtest-time `NameError`; they cannot silently produce a wrong metric.
+
+## Advanced Configuration
+
+### Workflow Feature Flags
+
+The following values are present in both [`configs/config-optimization.yml`](configs/config-optimization.yml) and [`configs/config-optimization-no-telemetry.yml`](configs/config-optimization-no-telemetry.yml):
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `parallel_generation` | `false` | Generate hypothesis LLM calls concurrently when more than one signal is requested. |
+| `max_concurrency` | `4` | Maximum simultaneous hypothesis LLM calls when `parallel_generation` is enabled. |
+| `genetic_crossover` | `false` | Create one crossover candidate from the two best evaluated parents and carry it into the next iteration. |
+| `genetic_parents` | `2` | Number of top-`|IC|` parents considered; the first two are combined and any additional parents are supplied as context. |
+| `skeptic_review` | `false` | Run the pre-backtest candidate review. |
+| `skeptic_llm` | `null` | Optional LLM block for the review; `null` runs deterministic static checks only. |
+| `oos_validation` | `false` | Add the chronological in-sample/out-of-sample IC check. |
+| `oos_train_ratio` | `0.7` | Fraction of aligned dates assigned to the in-sample split. |
+| `oos_reject_overfit` | `false` | Prevent a candidate classified as overfit from satisfying the acceptance gate. |
+| `save_evolution` | `true` | Persist every iteration with `run_id`, `lineage`, and request metadata. |
+
+### Runtime Evaluation Switches
+
+The boolean and backend switches are read at evaluation time. The cache-size override is read when the shared operator cache is initialized:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SIGNAL_SANDBOX_ENABLED` | `false` | Enables the evaluator's restricted in-process sandbox path. `1`, `true`, `yes`, and `on` are treated as enabled. |
+| `SIGNAL_USE_GPU` | `false` | Enables GPU delegation for Rank IC computation. |
+| `SIGNAL_GPU_BACKEND` | `auto` | Selects `auto`, `cupy`, `torch`, or `cpu`; an unusable explicit GPU backend falls back to CPU. |
+| `SIGNAL_USE_OPERATOR_CACHE` | `false` | Enables memoization of generated operator calls. |
+| `SIGNAL_OPERATOR_CACHE_MAX_ENTRIES` | `512` | Maximum number of entries in the shared LRU operator cache when it is initialized; invalid or non-positive values fall back to the default. |
+
+### Dataset Presets
+
+| Preset | Source | Default universe | Fields |
+|--------|--------|------------------|--------|
+| `sp500` | yfinance | 392 static symbols | Open, High, Low, Close, Volume |
+| `nasdaq100` | yfinance | 99 static symbols | Open, High, Low, Close, Volume |
+| `sectors` | yfinance | 11 US sector SPDR ETFs | Open, High, Low, Close, Volume |
+| `forex_major` | yfinance | 7 major USD pairs | Open, High, Low, Close, Volume |
+| `crypto_spot` | yfinance | 6 USD-quoted spot pairs | Open, High, Low, Close, Volume |
+| `crypto_futures` | Binance | 7 registry examples; dedicated CLI defaults to the top 60 | Open, High, Low, Close, Volume |
+| `fundamentals` | yfinance | 10 symbols | Seven current point-in-time snapshot fields |
+| `sentiment` | Injected provider | 5 symbols | `news_sentiment_score`, `article_count` |
+
+Each OHLCV file uses dates as rows and symbols as columns. Datasets handled by the generic downloader also receive a `manifest.json` with the dataset, symbols, source, fetch time, and file dimensions.
+
+## Portfolio Metrics and Out-of-Sample Validation
+
+### Portfolio Construction
+
+For each date, the workflow selects the top 20% and bottom 20% of valid signal values. Each bucket is equal-weighted; the long bucket totals `+0.5`, the short bucket totals `-0.5`, gross exposure is `1.0`, and net exposure is `0.0`. If the two buckets cannot be filled with distinct names, the date remains uninvested. A portfolio return is valid only when every held position has a finite forward return.
+
+### Metric Formulas
+
+The workflow uses `periods_per_year = 252`. In the formulas below, `r` is a valid portfolio return, `N` is the number of valid returns, `w` is a portfolio weight row, and `rf` is the annual risk-free rate.
+
+| Metric | Formula | Convention |
+|--------|---------|------------|
+| `annual_return` | `mean(r) × periods_per_year` | Arithmetic annualization. |
+| `cagr` | `prod(1 + r) ** (periods_per_year / N) - 1` | Geometric annualization; zero when final equity is not positive. |
+| `annual_volatility` | `std(r, ddof=1) × sqrt(periods_per_year)` | Sample standard deviation. |
+| `sharpe_ratio` | `(mean(r) - rf / periods_per_year) / std(r, ddof=1) × sqrt(periods_per_year)` | Uses sample standard deviation (`ddof=1`). |
+| `sortino_ratio` | `(mean(r) - rf / periods_per_year) / sqrt(mean(min(0, r - rf / periods_per_year) ** 2)) × sqrt(periods_per_year)` | Downside deviation uses the full sample. |
+| `max_drawdown` | `min(equity / running_max(equity) - 1)` | Initial equity `1.0` is included in the running maximum. |
+| `calmar_ratio` | `annual_return / abs(max_drawdown)` | Uses arithmetic annual return. |
+| `total_return` | `prod(1 + r) - 1` | Compounded period return. |
+| `turnover` | `mean(sum(abs(w[t] - w[t-1]))) × periods_per_year` | Full absolute-weight-change, two-way convention. |
+| `best_day`, `worst_day` | `max(r)`, `min(r)` | Raw, unannualized period returns. |
+
+Missing and non-finite returns are excluded. Undefined ratios and sample-risk statistics are reported as `0.0`; a series is treated as riskless when its dispersion is at or below `max(1e-12, abs(mean(r)) × 1e-9)`. Portfolio metrics are merged additively into the Rank IC result and do not replace its `num_periods`, which remains the number of usable IC dates.
+
+### Out-of-Sample Rules
+
+The validation is one chronological split, not walk-forward cross-validation: aligned dates are sorted and divided at `floor(len(dates) × oos_train_ratio)`. A candidate is classified as overfit when any of these conditions holds:
+
+- In-sample and out-of-sample mean IC have opposite signs.
+- `abs(test_mean_ic) < 0.5 × abs(train_mean_ic)`.
+- Either split has fewer than 30 usable IC dates.
+- Either split is missing an IC value.
+
+With `oos_reject_overfit: true`, a flagged candidate cannot satisfy the acceptance gate. The workflow continues with targeted feedback and can still return that candidate as a `best_effort` result.
+
+## Quick Start: Multi-Asset Data
+
+List the registered presets without contacting a data provider:
+
+```bash
+.venv/bin/python -m signal_discovery_workflow.download_market_data --all-presets
+```
+
+Inspect a download plan without fetching data:
+
+```bash
+.venv/bin/python -m signal_discovery_workflow.download_market_data --dataset crypto_spot --dry-run
+```
+
+Download a preset into the evaluator-compatible layout:
+
+```bash
+.venv/bin/python -m signal_discovery_workflow.download_market_data \
+  --dataset sectors \
+  --start 2015-01-01 \
+  --end 2025-12-31
+```
+
+Downloads default to `src/signal_discovery_workflow/data/<dataset>/`. The workflow evaluator currently reads `src/signal_discovery_workflow/data/sp500/`, so place the selected `Open.csv`, `High.csv`, `Low.csv`, `Close.csv`, and `Volume.csv` files in that directory before running the evaluator. Binance perpetual futures use the dedicated downloader, which selects symbols by quote volume:
+
+```bash
+.venv/bin/python -m signal_discovery_workflow.download_binance_futures --symbols 60 --interval 1d
+```
+
+## Quick Start: Dashboard
+
+Start the local dashboard:
+
+```bash
+.venv/bin/python -m uvicorn dashboard.app:app --host 0.0.0.0 --port 8090
+```
+
+Open http://localhost:8090. With `save_evolution: true`, saved files use the `signal_<run_id>_iter<n>.json` naming pattern under `src/signal_discovery_workflow/output/`. These new-format artifacts may include a top-level `skeptic_reviews` array of per-iteration reviews containing `name`, `verdict` (`approve`/`reject`), `issues`, `static_risks`, `vetoed`, and `reasons`; `save_evolution: false` keeps legacy artifacts byte-compatible without it. The evolution and metrics APIs can also be queried directly:
+
+```bash
+curl -s http://127.0.0.1:8090/api/evolution
+curl -s http://127.0.0.1:8090/api/evolution/YOUR_RUN_ID
+curl -s http://127.0.0.1:8090/api/metrics/summary
+```
+
+`GET /api/evolution` returns run summaries, lineage trees, and aggregate evolution statistics. `GET /api/evolution/{run_id}` adds the saved formulas, generated code, and optimization feedback for one run. `GET /api/metrics/summary` returns metric availability, minima, maxima, and overfit flags. The EVOLUTION tab shows `SKEPTIC · N rejected · M approved` per node and one reason line per rejected candidate. These three endpoints parse saved JSON only; they do not execute the saved signal code.
+
+## Limitations and Caveats
+
+- **Sandbox boundary:** the in-process sandbox is AST validation plus restricted execution, not a security boundary. Subprocess mode adds resource limits and is stronger, but it is still not an operating-system container. Use container isolation for hostile code.
+- **Sandbox mode:** `SIGNAL_SANDBOX_ENABLED=1` selects the evaluator's in-process restricted mode. Subprocess isolation is available only through `execute_signal_code_sandboxed(..., allow_subprocess=True)`.
+- **GPU verification:** the environment used to verify this feature set had no usable NVIDIA GPU, so `get_backend()` resolved to `"cpu"` and the real CUDA path was not exercised. CuPy and PyTorch wheels are optional, not default dependencies.
+- **Non-finite GPU inputs:** the device path masks `±inf` while the CPU path retains it through `dropna()` semantics. Device and CPU results can therefore differ for `±inf`; NaN-only inputs match.
+- **Sentiment provider:** sentiment requires an injected provider. The default fetcher makes no network request, returns empty frames, and writes no sentiment data file.
+- **Static universes:** the Nasdaq-100 preset is a static, approximately 100-name list (99 symbols in the current source), not a live constituent index. Other preset universes are also snapshots rather than continuously refreshed memberships.
+- **Cache economics:** benefit depends on operator cost and workload mix. With the fingerprint memo, operator-level caching measured approximately `4.8x-5.9x` faster; end-to-end through `signal_evaluator.execute_signal_code`, gains ranged from about `1.0x` for backtest-dominated workloads to roughly `9x` for operator-dominated workloads, depending on operator time versus downstream backtest time. The cache is off by default; there is no universal speedup.
+- **Cache ownership:** the generic operator-cache API returns cached objects by reference unless `copy_on_return=True`; the evaluator integration uses shallow copies. Sandboxed execution runs in its own namespace and is outside the evaluator's operator cache.
+- **OOS scope:** the OOS check is a single chronological split, with no walk-forward folds, purge/embargo window, or multiple-testing correction.
+- **Costs and capacity:** portfolio metrics do not deduct transaction costs, slippage, borrow costs, financing, taxes, or market impact; turnover is a diagnostic rather than a modeled cost.
+- **Annualization:** workflow portfolio metrics are hard-coded to 252 periods per year even though `forward_periods` is configurable. Adjust the integration if the portfolio return period is not one daily period.
+- **Fundamental snapshots:** the default fundamentals fetcher reads current `Ticker.info` snapshots; the optional combine helper can broadcast them across the sample. It does not provide historically point-in-time fundamentals, so using them in a backtest can introduce lookahead bias.
+- **Dashboard scope:** only the evolution and metrics-summary endpoints documented above are passive JSON readers. Other dashboard analysis endpoints may evaluate saved signal code.
+
 ## Additional Resources
 
 - [NeMo Agent Toolkit Documentation](https://docs.nvidia.com/nemo-agent-toolkit/)
 - [Arize Phoenix Documentation](https://arize.com/docs/phoenix)
 - [NeMo Fine-tuning Guide](https://docs.nvidia.com/nemo-framework/user-guide/latest/sft_peft/index.html) — to specialize Nemotron on your signal history
+- [Sandbox Security Model](SANDBOXING.md) — AST validation, restricted execution and subprocess isolation for LLM-generated signal code
 
 ## License
 
