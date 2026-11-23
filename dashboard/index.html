@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<title>IRON SIGNAL — Binance Futures</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--cyan:#00e5ff;--orange:#ff6b1a;--edge:#1f2a44;--panel:rgba(10,18,38,.75)}
+*{box-sizing:border-box}
+body{margin:0;height:100vh;overflow:hidden;background:radial-gradient(ellipse at 15% 0%,#0e1e42 0%,#050810 55%);color:#d9e6f2;font-family:'Inter',system-ui,sans-serif}
+body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent 0 3px,rgba(0,229,255,.022) 3px 4px);pointer-events:none;z-index:0}
+.title{font-family:'Orbitron',sans-serif;font-weight:900;letter-spacing:.14em;text-transform:uppercase;background:linear-gradient(90deg,var(--cyan),var(--orange));-webkit-background-clip:text;background-clip:text;color:transparent;filter:drop-shadow(0 0 12px rgba(0,229,255,.35))}
+.hud{background:linear-gradient(180deg,rgba(12,22,44,.88),rgba(5,8,16,.96));border:1px solid var(--edge);border-radius:12px;padding:16px;backdrop-filter:blur(10px);box-shadow:0 8px 32px rgba(0,0,0,.4),0 0 24px rgba(0,229,255,.05),inset 0 1px 0 rgba(255,255,255,.05)}
+.btn{background:linear-gradient(135deg,rgba(0,229,255,.18),rgba(255,107,26,.18));border:1px solid var(--cyan);color:var(--cyan);padding:8px 16px;border-radius:8px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;transition:all .2s;cursor:pointer;font-size:11px;font-family:'Orbitron',sans-serif}
+.btn:hover{background:var(--cyan);color:#050810;box-shadow:0 0 22px var(--cyan);transform:translateY(-1px)}
+.btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.input{background:rgba(5,8,16,.85);border:1px solid var(--edge);color:#d9e6f2;padding:8px 12px;border-radius:8px;width:100%;font-family:'Inter',sans-serif;font-size:12px;transition:border-color .2s,box-shadow .2s}
+.input:focus{outline:none;border-color:var(--cyan);box-shadow:0 0 14px rgba(0,229,255,.25)}
+.tab{padding:10px 20px;cursor:pointer;border-bottom:2px solid transparent;color:#6b7280;font-size:12px;letter-spacing:.12em;font-weight:600;transition:all .2s;font-family:'Orbitron',sans-serif}
+.tab.active{color:var(--cyan);border-bottom-color:var(--cyan);text-shadow:0 0 8px var(--cyan)}
+.tag{display:inline-block;padding:3px 10px;border:1px solid var(--orange);color:var(--orange);font-size:10px;letter-spacing:.12em;border-radius:4px;font-weight:700;font-family:'Orbitron',sans-serif}
+.pulse{animation:pulse 1.6s infinite}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 8px var(--orange)}50%{opacity:.5;box-shadow:none}}
+.signal-card{background:linear-gradient(135deg,rgba(0,229,255,.06),rgba(255,107,26,.04));border:1px solid var(--edge);border-left:3px solid var(--cyan);padding:14px;margin-bottom:10px;border-radius:10px;transition:transform .2s,box-shadow .2s;cursor:pointer}
+.signal-card:hover{transform:translateX(4px);box-shadow:0 0 22px rgba(0,229,255,.12)}
+.metric{font-size:22px;font-weight:800;color:var(--cyan);font-family:'Orbitron',sans-serif;text-shadow:0 0 10px rgba(0,229,255,.3)}
+.grid-bg{background-image:linear-gradient(rgba(0,229,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,255,.035) 1px,transparent 1px);background-size:36px 36px}
+.symbol-chip{display:inline-block;padding:4px 10px;margin:3px;border-radius:6px;font-family:'Orbitron',sans-serif;font-size:11px;font-weight:700;letter-spacing:.05em}
+.long-chip{background:rgba(0,255,136,.12);border:1px solid #00ff88;color:#00ff88;box-shadow:0 0 8px rgba(0,255,136,.2)}
+.short-chip{background:rgba(255,68,68,.12);border:1px solid #ff4444;color:#ff4444;box-shadow:0 0 8px rgba(255,68,68,.2)}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:rgba(0,229,255,.25);border-radius:4px}
+::-webkit-scrollbar-track{background:rgba(255,255,255,.03)}
+.section-title{font-family:'Orbitron',sans-serif;font-size:11px;letter-spacing:.18em;color:#9ca3af;margin-bottom:8px}
+/* EVOLUTION */
+.evo-node{background:linear-gradient(180deg,rgba(12,22,44,.9),rgba(5,8,16,.95));border:1px solid var(--edge);border-radius:10px;padding:8px 10px;min-width:200px;max-width:240px;cursor:pointer;transition:box-shadow .2s,transform .2s;border-left:3px solid #6b7280}
+.evo-node:hover{transform:translateY(-1px);box-shadow:0 0 18px rgba(0,229,255,.18)}
+.evo-node.sel{box-shadow:0 0 0 1px var(--cyan),0 0 18px rgba(0,229,255,.3);border-color:var(--cyan)}
+.evo-node.strong{border-left-color:#00ff88}
+.evo-node.neg{border-left-color:#ff4444}
+.evo-node.weak{border-left-color:#f59e0b}
+.evo-badge{display:inline-block;padding:1px 6px;margin:1px;border-radius:4px;font-size:9px;letter-spacing:.08em;font-weight:700;font-family:'Orbitron',sans-serif;border:1px solid}
+.evo-link{width:26px;height:2px;background:linear-gradient(90deg,var(--cyan),rgba(0,229,255,.15));flex:none}
+.evo-branch{border-left:2px solid rgba(0,229,255,.25);padding-left:0}
+.evo-run{cursor:pointer;border:1px solid var(--edge);border-left:3px solid #374151;border-radius:8px;padding:8px 10px;margin-bottom:6px;transition:all .15s}
+.evo-run:hover{border-left-color:var(--cyan)}
+.evo-run.sel{border-left-color:var(--cyan);background:rgba(0,229,255,.06)}
+.evo-table{width:100%;font-size:11px;border-collapse:collapse}
+.evo-table td{padding:3px 6px;border-bottom:1px solid rgba(31,42,68,.7)}
+</style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body class="grid-bg flex flex-col">
+<header class="flex items-center justify-between px-6 py-3 border-b border-gray-800/60 relative z-10">
+  <div class="flex items-center gap-4">
+    <div class="title text-3xl">IRON SIGNAL</div>
+    <div class="text-xs text-gray-500 tracking-widest border-l border-gray-700 pl-4">BINANCE USDT-M FUTURES · SIGNAL DISCOVERY ENGINE</div>
+  </div>
+  <div class="flex items-center gap-4">
+    <span id="status" class="tag">IDLE</span>
+    <span id="clock" class="text-sm text-gray-400 font-mono"></span>
+  </div>
+</header>
+<nav class="flex border-b border-gray-800/60 px-6 relative z-10">
+  <div class="tab active" onclick="showTab('console',this)">CONSOLE</div>
+  <div class="tab" onclick="showTab('signals',this)">SIGNALS</div>
+  <div class="tab" onclick="showTab('evolution',this)">EVOLUTION</div>
+  <div class="tab" onclick="showTab('consensus',this)">CONSENSUS</div>
+  <div class="tab" onclick="showTab('portfolio',this)">PORTFOLIO</div>
+  <div class="tab" onclick="showTab('telemetry',this)">TELEMETRY</div>
+  <div class="tab" onclick="showTab('perf',this)">PERFORMANCE</div>
+</nav>
+<main class="flex-1 overflow-hidden p-4 relative z-10" style="height:calc(100vh - 90px)">
+  <section id="tab-console" class="h-full grid grid-cols-12 gap-4">
+    <div class="col-span-4 hud flex flex-col">
+      <div class="section-title">COMMAND CONSOLE</div>
+      <input id="inp" class="input" value="momentum signals">
+      <div class="flex gap-2 mt-3">
+        <button id="btn" onclick="run()" class="btn flex-1">SCAN</button>
+        <button onclick="autoStart()" class="btn">AUTO 1M</button>
+        <button onclick="autoStop()" class="btn">STOP</button>
+      </div>
+      <div class="text-xs text-gray-500 mt-4 mb-2 tracking-widest">PRESETS</div>
+      <div class="flex flex-wrap gap-2">
+        <button class="btn" style="padding:4px 8px;font-size:9px" onclick="preset('momentum signals')">MOMENTUM</button>
+        <button class="btn" style="padding:4px 8px;font-size:9px" onclick="preset('volatility signals')">VOLATILITY</button>
+        <button class="btn" style="padding:4px 8px;font-size:9px" onclick="preset('mean reversion signals')">MEAN REV</button>
+        <button class="btn" style="padding:4px 8px;font-size:9px" onclick="preset('volume price divergence signals')">VOLUME</button>
+      </div>
+      <div class="mt-auto pt-4 text-xs text-gray-500 tracking-widest">AUTO MODE: <span id="auto" class="text-cyan-400 font-bold">OFF</span></div>
+    </div>
+    <div class="col-span-8 hud flex flex-col min-h-0">
+      <div class="section-title">TELEMETRY LOG</div>
+      <pre id="log" class="flex-1 overflow-auto text-xs font-mono text-green-300 whitespace-pre-wrap leading-relaxed min-h-0" style="font-size:10px"></pre>
+    </div>
+  </section>
+  <section id="tab-signals" class="h-full grid grid-cols-12 gap-4 hidden">
+    <div class="col-span-5 hud overflow-auto min-h-0">
+      <div class="section-title">DISCOVERED SIGNALS</div>
+      <div id="signals"></div>
+    </div>
+    <div class="col-span-7 hud overflow-auto min-h-0">
+      <div class="section-title">SELECTED SIGNAL · DETAILS</div>
+      <div id="detail" class="text-sm"></div>
+    </div>
+  </section>
+  <section id="tab-evolution" class="h-full flex flex-col gap-3 hidden">
+    <div class="flex items-center gap-3">
+      <div id="evo_strip" class="hud flex-1" style="padding:10px 16px"></div>
+      <button onclick="renderEvolution(true)" class="btn" style="padding:8px 12px">REFRESH</button>
+    </div>
+    <div class="flex-1 grid grid-cols-12 gap-4 min-h-0">
+      <div class="col-span-3 hud overflow-auto min-h-0">
+        <div class="section-title">RUNS · <span id="evo_runs_count" class="text-cyan-400"></span></div>
+        <input id="evo_filter" class="input mb-2" placeholder="filter run / signal..." oninput="renderEvoRuns()">
+        <div id="evo_runs" class="text-xs"></div>
+      </div>
+      <div class="col-span-5 hud overflow-auto min-h-0">
+        <div class="section-title">EVOLUTION TREE · <span id="evo_tree_title" class="text-cyan-400"></span></div>
+        <div id="evo_tree" class="text-xs py-2"></div>
+      </div>
+      <div class="col-span-4 hud overflow-auto min-h-0">
+        <div class="section-title">NODE DETAILS</div>
+        <div id="evo_detail" class="text-sm"><div class="text-gray-500 text-xs">Select a node in the tree</div></div>
+      </div>
+    </div>
+  </section>
+  <section id="tab-consensus" class="h-full hud overflow-auto min-h-0 hidden">
+    <div class="section-title">SIGNAL CONSENSUS · <span id="cons_count" class="text-cyan-400"></span> <button onclick="exportCSV()" class="btn ml-4" style="padding:2px 8px;font-size:9px">EXPORT CSV</button> <button onclick="sendAlert()" class="btn ml-2" style="padding:2px 8px;font-size:9px">SEND ALERT</button> <button onclick="paperOpen()" class="btn ml-2" style="padding:2px 8px;font-size:9px">PAPER OPEN</button> <button onclick="paperClose()" class="btn ml-2" style="padding:2px 8px;font-size:9px">PAPER CLOSE</button></div>
+    <div class="grid grid-cols-12 gap-4">
+      <div class="col-span-7">
+        <div id="consensus" class="text-xs"></div>
+      </div>
+      <div class="col-span-5">
+        <div id="consensus-stats" class="text-xs"></div>
+        <div class="section-title mt-4">PAPER TRADING</div>
+        <div id="paper" class="text-xs"></div>
+      </div>
+    </div>
+  </section>
+    <section id="tab-portfolio" class="h-full hud overflow-auto min-h-0 hidden">
+    <div class="flex items-center justify-between mb-3">
+      <div class="section-title">PORTFOLIO</div>
+      <div id="port_status" class="text-xs text-gray-400"></div>
+    </div>
+    <div class="grid grid-cols-12 gap-4" style="height:calc(100vh - 160px)">
+      <div class="col-span-8 rounded-xl border border-gray-800 bg-gray-900/60 p-4 flex flex-col">
+        <div class="text-xs text-gray-400 mb-2">EQUITY CURVE</div>
+        <div class="flex-1 relative">
+          <canvas id="port_chart" width="900" height="420" style="width:100%;height:100%"></canvas>
+        </div>
+        <div style="height:120px" class="mt-2">
+          <canvas id="port_bars" width="900" height="120" style="width:100%;height:100%"></canvas>
+        </div>
+      </div>
+      <div class="col-span-4 flex flex-col gap-3 overflow-auto">
+        <div class="grid grid-cols-2 gap-3">
+          <div class="rounded-xl border border-gray-800 bg-gray-900/60 p-3"><div class="text-xs text-gray-400">Total PnL</div><div id="kpi_pnl" class="text-xl font-bold">—</div></div>
+          <div class="rounded-xl border border-gray-800 bg-gray-900/50 p-3"><div class="text-xs text-gray-400">Open</div><div id="kpi_n" class="text-xl font-bold">—</div></div>
+          <div class="rounded-xl border border-gray-800 bg-gray-900/50 p-3"><div class="text-xs text-gray-400">Win Rate</div><div id="kpi_wr" class="text-xl font-bold">—</div></div>
+          <div class="rounded-xl border border-gray-800 bg-gray-900/50 p-3"><div class="text-xs text-gray-400">Best</div><div id="kpi_best" class="text-xl font-bold text-green-400">—</div></div>
+        </div>
+        <div class="rounded-xl border border-gray-800 bg-gray-900/50 p-3 flex-1 overflow-auto">
+          <div class="text-xs text-gray-400 tracking-widest mb-2">POSITIONS</div>
+          <div id="port_positions" class="text-sm space-y-2"></div>
+        </div>
+        <div class="rounded-xl border border-gray-800 bg-gray-900/50 p-3 mt-3" style="max-height:160px;overflow:auto">
+          <div class="text-xs text-gray-400 tracking-widest mb-2">CLOSED TRADES</div>
+          <div id="port_closed" class="text-sm space-y-1"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+  <section id="tab-telemetry" class="h-full hud overflow-auto hidden">
+    <div class="section-title">FULL TELEMETRY LOG</div>
+    <pre id="log2" class="text-xs font-mono text-green-300 whitespace-pre-wrap leading-relaxed"></pre>
+  </section>
+  <section id="tab-perf" class="h-full hud hidden flex flex-col">
+    <div class="section-title">IC PERFORMANCE</div>
+    <canvas id="chart" class="flex-1"></canvas>
+  </section>
+  <div id="cardmodal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;align-items:center;justify-content:center">
+    <div class="hud" style="width:420px;max-width:90vw">
+      <div id="cardbox"></div>
+    </div>
+  </div>
+</main>
+<script>
+// ---- escaping helpers (SECURITY: use for ALL data-derived text reaching innerHTML) ----
+// esc(s): HTML text and quoted-attribute contexts (element text, title="...", <span>...).
+//   Escapes & < > " ' -> character entities. Safe anywhere the value sits between
+//   HTML delimiters, NOT safe by itself inside inline JS handlers (entities are
+//   HTML-decoded before the JS engine parses the handler).
+// escJs(s): data values embedded in inline event handlers, e.g.
+//   onclick="showCard('${escJs(x)}')". Escapes JS string-significant characters
+//   (backslash, ' " `, newline, CR, TAB, < > &) FIRST, then HTML-escapes, so after
+//   the browser decodes the attribute the JS string literal stays intact.
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function escJs(s){return esc(String(s??'').replace(/[\\'"\n\r\t`<>&]/g,c=>({'\\':'\\\\',"'":"\\'",'"':'\\"','`':'\\`','\n':'\\n','\r':'\\r','\t':'\\t','<':'\\u003c','>':'\\u003e','&':'\\u0026'}[c])))}
+function clock(){document.getElementById('clock').textContent=new Date().toLocaleTimeString()}
+setInterval(clock,1000);clock();
+function showTab(t,el){document.querySelectorAll('section').forEach(s=>s.classList.add('hidden'));document.getElementById('tab-'+t).classList.remove('hidden');document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));el.classList.add('active'); if(t==='portfolio') renderPortfolio(); if(t==='evolution') renderEvolution();}
+function fmtP(n,ref){const d=(String(ref).split('.')[1]||'').length;return Number(n).toFixed(Math.min(d+1,8));}
+function preset(v){document.getElementById('inp').value=v}
+async function refresh(){
+  const s=await fetch('/api/status').then(r=>r.json());
+  const st=document.getElementById('status');
+  if(s.running){st.textContent='SCANNING';st.className='tag pulse';}
+  else if(s.last && s.last.error){st.textContent='FAILED';st.className='tag';st.style.color='#ff4444';}
+  else if(s.last){st.textContent='COMPLETE';st.className='tag';st.style.color='#00ff88';}
+  else {st.textContent='IDLE';st.className='tag';st.style.color='var(--orange)';}
+  document.getElementById('log').textContent=s.log||'';
+  document.getElementById('log2').textContent=s.log||'';
+  document.getElementById('auto').textContent=s.auto?'ON':'OFF';
+  const sigs=await fetch('/api/signals').then(r=>r.json());
+  const top=await fetch('/api/top').then(r=>r.json());
+  const el=document.getElementById('signals');
+  el.innerHTML=sigs.map((s,i)=>{
+    const d=s.data||{};const m=d.evaluation_metrics||d.metrics||{};
+    return `<div class="signal-card" onclick="showDetail(${i})">
+      <div class="flex justify-between items-start gap-2">
+        <div class="font-bold text-cyan-300 text-sm truncate min-w-0" title="${esc(d.selected_signal||s.file)}">${esc(d.selected_signal||s.file)}</div>
+        <span class="tag">${esc(d.status||'—')}</span>
+      </div>
+      <div class="text-xs text-gray-400 mt-1">${esc(d.headline||'')}</div>
+      <div class="grid grid-cols-2 gap-x-4 gap-y-2 mt-3">
+        <div><div class="text-xs text-gray-500 tracking-widest">IC</div><div class="metric" style="font-size:14px">${(m.mean_ic??0).toFixed(4)}</div></div>
+        <div><div class="text-xs text-gray-500 tracking-widest">p</div><div class="metric" style="font-size:14px">${(m.p_value??0).toFixed(4)}</div></div>
+        <div><div class="text-xs text-gray-500 tracking-widest">IR</div><div class="metric" style="font-size:14px">${(m.ic_ir??0).toFixed(3)}</div></div>
+        <div><div class="text-xs text-gray-500 tracking-widest">t</div><div class="metric" style="font-size:14px">${(m.t_stat??0).toFixed(2)}</div></div>
+      </div>
+    </div>`;
+  }).join('')||'<div class="text-gray-500 text-center py-8">NO SIGNALS YET — INITIATE SCAN</div>';
+  window._sigs=sigs;
+  // detail
+  if(top.error){document.getElementById('detail').innerHTML='<div class="text-gray-500">'+esc(top.error)+'</div>';}
+  else { renderDetail(top.signal, top.longs||[], top.shorts||[]); }
+  // consensus
+  const cons=await fetch('/api/consensus').then(r=>r.json());
+  const prices=await fetch('/api/prices').then(r=>r.json()).catch(()=>({}));
+  const paper=await fetch('/api/paper/status').then(r=>r.json()).catch(()=>({}));
+  const pel=document.getElementById('paper');
+  const paperPositions=Array.isArray(paper.positions)?paper.positions:[];
+  const limits=paper.limits||{};
+  const openCount=paperPositions.length;
+  const maxOpen=(limits.max_open_positions===null||limits.max_open_positions===undefined)?'—':limits.max_open_positions;
+  const starting=(limits.starting_balance===null||limits.starting_balance===undefined)?'—':limits.starting_balance;
+  const pctLimit=(limits.max_position_size_pct===null||limits.max_position_size_pct===undefined)?null:limits.max_position_size_pct;
+  const amountLimit=(limits.max_position_size_amount===null||limits.max_position_size_amount===undefined)?null:limits.max_position_size_amount;
+  const hasPct=pctLimit!==null,hasAmount=amountLimit!==null;
+  const perPosition=(hasPct||hasAmount)?(hasPct?esc(pctLimit)+'% of free balance':'')+(hasPct&&hasAmount?' · ':'')+(hasAmount?esc(amountLimit)+' USDT':''):'No per-position notional limit';
+  const lastOpen=window._paperOpenResult||{};
+  const skipped=Array.isArray(lastOpen.skipped)?lastOpen.skipped:[];
+  const sideCounts=paper.side_counts||{};
+  const perSide=(limits.max_positions_per_side===null||limits.max_positions_per_side===undefined)?'—':limits.max_positions_per_side;
+  const regimeInfo=lastOpen.regime||paper.regime||null;
+  const regimeOn=!!(regimeInfo&&regimeInfo.enabled!==false);
+  const regimeCombined=regimeInfo?(regimeOn?(regimeInfo.combined||'neutral'):'off'):'—';
+  const regimeBtc=regimeInfo?(regimeOn?(regimeInfo.btc||'unknown'):'—'):'—';
+  const regimeCons=regimeInfo?(regimeOn?(regimeInfo.consensus||'neutral'):'—'):'—';
+  const configError=paper.config_error?`CONFIG ERROR: ${esc(paper.error||'invalid paper-trading config')}`:'';
+  pel.innerHTML=`<div class="mb-2 p-2 border border-gray-700 rounded">
+    <div>Open positions: <span class="font-bold text-cyan-300">${esc(openCount)}</span> / ${esc(maxOpen)}</div>
+    <div class="text-gray-400 mt-1">Starting balance: ${esc(starting)} USDT</div>
+    <div class="text-gray-400 mt-1">Max per position: ${esc(perPosition)}</div>
+    <div class="text-gray-400 mt-1">Side cap: ${esc(sideCounts.long||0)} long · ${esc(sideCounts.short||0)} short (max ${esc(perSide)} per side)</div>
+    <div class="text-gray-400 mt-1">Market regime: <span class="text-cyan-300">${esc(regimeCombined)}</span> · proxy ${esc(regimeBtc)} · consensus ${esc(regimeCons)}</div>
+    ${configError?`<div class="text-red-400 mt-1">${esc(configError)}</div>`:''}
+  </div>
+  ${paperPositions.length?`<div class="mb-2">Total PnL: <span class="${(paper.total_pnl||0)>=0?'text-green-400':'text-red-400'} font-bold">${(paper.total_pnl||0).toFixed(4)}</span></div>`:''}
+  ${paperPositions.map(p=>`<div class="flex justify-between py-1 border-b border-gray-800/50">
+    <span>${esc(p.symbol)} <span class="${p.side==='long'?'text-green-400':'text-red-400'}">${esc(p.side)}</span></span>
+    <span>entry ${esc(p.entry)} → ${esc(p.mark||'—')} <span class="${(p.pnl||0)>=0?'text-green-400':'text-red-400'}">${esc((p.pnl||0).toFixed(4))}</span></span>
+  </div>
+  <div class="text-xs text-cyan-300 pl-2 pb-2">SL ${esc(fmtP(p.sl,p.entry))} · TP ${esc(fmtP(p.tp,p.entry))}</div>`).join('')}
+  ${!paperPositions.length?`<div class="text-gray-500">No open positions. Last PnL: ${esc(paper.last_pnl!==undefined?paper.last_pnl:'—')}</div>`:''}
+  ${skipped.length?`<div class="mt-3 p-2 border border-yellow-900/60 rounded text-yellow-300">
+    <div class="tracking-widest mb-1">SKIPPED CANDIDATES</div>
+    ${skipped.map(s=>`<div>${esc(s.symbol)} · ${esc(s.side)} — ${esc(s.reason)}</div>`).join('')}
+  </div>`:''}`;
+  const cel=document.getElementById('consensus');
+  const cstat=document.getElementById('consensus-stats');
+  if(cons.error){cel.innerHTML='<div class="text-gray-500">'+esc(cons.error)+'</div>';document.getElementById('cons_count').textContent='';}
+  else{
+    document.getElementById('cons_count').textContent=cons.signals_used+' signals · votes';
+    const s=cons.summary||{};
+    const stateColor=s.market_state==='BULLISH'?'text-green-400':s.market_state==='BEARISH'?'text-red-400':'text-yellow-400';
+    cstat.innerHTML=`<div class="mb-4 p-3 border border-gray-700 rounded">
+      <div class="text-xs text-gray-400 tracking-widest mb-1">MARKET STATE</div>
+      <div class="text-2xl font-bold ${stateColor}" style="font-family:'Orbitron',sans-serif">${esc(s.market_state||'—')} <span class="text-sm text-gray-500">(${((s.strength||0)*100).toFixed(1)}%)</span></div>
+      <div class="text-xs text-gray-500 mt-1">${s.pos||0} up / ${s.neg||0} down</div>
+    </div>
+    <div class="grid grid-cols-2 gap-3 mb-3">
+      <div class="p-3 border border-green-900/50 rounded">
+        <div class="text-xs text-green-400 tracking-widest mb-2">TOP 3 BUY</div>
+        ${(s.top_buy||[]).map(r=>`<div class="flex justify-between py-1"><span class="cursor-pointer hover:text-cyan-300" onclick="showCard('${escJs(r.symbol)}')">${esc(r.symbol)}</span><span>${prices[r.symbol]?prices[r.symbol].price.toFixed(4):'—'} <span class="${(prices[r.symbol]?.change24h||0)>=0?'text-green-400':'text-red-400'} text-xs">${(prices[r.symbol]?.change24h||0).toFixed(2)}%</span></span></div>`).join('')}
+      </div>
+      <div class="p-3 border border-red-900/50 rounded">
+        <div class="text-xs text-red-400 tracking-widest mb-2">TOP 3 SELL</div>
+        ${(s.top_sell||[]).map(r=>`<div class="flex justify-between py-1"><span class="cursor-pointer hover:text-cyan-300" onclick="showCard('${escJs(r.symbol)}')">${esc(r.symbol)}</span><span>${prices[r.symbol]?prices[r.symbol].price.toFixed(4):'—'} <span class="${(prices[r.symbol]?.change24h||0)>=0?'text-green-400':'text-red-400'} text-xs">${(prices[r.symbol]?.change24h||0).toFixed(2)}%</span></span></div>`).join('')}
+      </div>
+    </div>`;
+    const max=Math.max(1,...cons.rows.map(r=>Math.max(r.long,r.short)));
+    cel.innerHTML=`<div class="section-title">ALL SYMBOLS</div>`+cons.rows.map(r=>`<div class="flex items-center gap-3 py-1 border-b border-gray-800/50">
+      <div class="w-24 cursor-pointer hover:text-cyan-300" onclick="showCard('${escJs(r.symbol)}')">${esc(r.symbol)}</div>
+      <div class="flex-1 flex items-center gap-1">
+        <div style="width:${r.long/max*45}%;background:rgba(0,255,136,.45)" class="h-3 rounded"></div>
+        <div class="text-gray-600">|</div>
+        <div style="width:${r.short/max*45}%;background:rgba(255,68,68,.45)" class="h-3 rounded"></div>
+      </div>
+      <div class="w-24 text-right ${r.net>0?'text-green-400':r.net<0?'text-red-400':'text-gray-400'}">${r.long}L / ${r.short}S</div>
+    </div>`).join('');
+  }
+  renderPortfolio();
+  const labels=sigs.map(s=>(s.data||{}).selected_signal||s.file);
+  const data=sigs.map(s=>(s.data||{}).evaluation_metrics?.mean_ic??(s.data||{}).metrics?.mean_ic??0);
+  if(window._chart)window._chart.destroy();
+  const ctx=document.getElementById('chart').getContext('2d');
+  window._chart=new Chart(ctx,{type:'bar',data:{labels,datasets:[{label:'Mean IC',data,backgroundColor:'rgba(0,229,255,.55)',borderColor:'#00e5ff',borderWidth:1,borderRadius:6}]},options:{plugins:{legend:{labels:{color:'#d9e6f2',font:{family:'Orbitron',size:10}}}},scales:{x:{ticks:{color:'#9ca3af',font:{size:10}}},y:{ticks:{color:'#9ca3af'},grid:{color:'rgba(255,255,255,.05)'}}}}});
+}
+function renderDetail(name,longs,shorts,metrics){
+  const detail=document.getElementById('detail');
+  detail.innerHTML=`<div class="mb-4">
+      <div class="text-cyan-300 font-bold text-lg mb-1 truncate" style="font-family:'Orbitron',sans-serif" title="${esc(name)}">${esc(name)}</div>
+      <div class="text-xs text-gray-500 mb-3">Cross-sectional signal: високе значення → LONG, низьке → SHORT</div>
+      ${(metrics&&metrics.mean_ic!==undefined)?`<div class="mb-3 p-2 border border-gray-700 rounded text-xs text-gray-300">Mean IC: <span class="text-cyan-300">${Number(metrics.mean_ic).toFixed(4)}</span> · IC IR: <span class="text-cyan-300">${Number(metrics.ic_ir).toFixed(4)}</span> · t: <span class="text-cyan-300">${Number(metrics.t_stat).toFixed(2)}</span> · p: <span class="text-cyan-300">${Number(metrics.p_value).toFixed(4)}</span> · pos IC: <span class="text-cyan-300">${(Number(metrics.positive_ic_ratio)*100).toFixed(1)}%</span></div>`:''}
+      <div class="mb-4">
+        <div class="text-xs text-gray-400 tracking-widest mb-2">LONG POSITIONS</div>
+        <div>${longs.map(x=>'<span class="symbol-chip long-chip" onclick="showCard(\''+escJs(x)+'\')">'+esc(x)+'</span>').join('')}</div>
+      </div>
+      <div>
+        <div class="text-xs text-gray-400 tracking-widest mb-2">SHORT POSITIONS</div>
+        <div>${shorts.map(x=>'<span class="symbol-chip short-chip" onclick="showCard(\''+escJs(x)+'\')">'+esc(x)+'</span>').join('')}</div>
+      </div>
+    </div>`;
+}
+async function paperOpen(showAlert=true){
+  const r=await fetch('/api/paper/open',{method:'POST'}).then(x=>x.json());
+  window._paperOpenResult=r;
+  if(showAlert){
+    const skipped=(r.skipped||[]).map(s=>`${esc(s.symbol)} (${esc(s.side)}): ${esc(s.reason)}`).join('\n');
+    const summary=r.error?`Error: ${esc(r.error)}`:`Opened ${esc(r.opened??0)} position(s)`;
+    alert(summary+(skipped?'\nSkipped:\n'+skipped:''));
+  }
+  return r;
+}
+async function paperClose(){
+  const r=await fetch('/api/paper/close',{method:'POST'}).then(x=>x.json());
+  window._paperOpenResult={skipped:[]};
+  alert(r.closed!==undefined?`Closed ${esc(r.closed)}, PnL ${esc(r.total_pnl)}`:esc(r.error||'failed'));
+}
+async function sendAlert(){const r=await fetch('/api/alert',{method:'POST'}).then(x=>x.json());alert(r.ok?'Alert sent':(r.error||'failed'));}
+async function exportCSV(){const cons=await fetch('/api/consensus').then(r=>r.json());const prices=await fetch('/api/prices').then(r=>r.json()).catch(()=>({}));let csv='symbol,long,short,net,price,change24h\n';for(const r of cons.rows){const p=prices[r.symbol]||{};csv+=`${r.symbol},${r.long},${r.short},${r.net},${p.price||''},${p.change24h||''}\n`;}const blob=new Blob([csv],{type:'text/csv'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='consensus.csv';a.click();}
+let _portChart=null;
+async function renderPortfolio(){
+  const h=await fetch('/api/paper/history').then(r=>r.json()).catch(()=>({history:[]}));
+  const hist=h.history||[];
+  const canvas=document.getElementById('port_chart');
+  if(!canvas) return;
+  // fetch status + render positions FIRST (independent of history)
+  const st=await fetch('/api/paper/status').then(r=>r.json()).catch(()=>({}));
+  const pel=document.getElementById('port_positions');
+  if(pel){
+    if(st.positions&&st.positions.length){
+      pel.innerHTML=st.positions.map(p=>`<div class="flex items-center justify-between py-2 border-b border-gray-800/50"><div class="flex items-center gap-2"><span class="px-2 py-0.5 text-xs rounded ${p.side==='long'?'bg-green-900/40 text-green-400':'bg-red-900/40 text-red-400'}">${esc(p.side.toUpperCase())}</span><span class="font-bold">${esc(p.symbol)}</span></div><div class="text-xs text-gray-400">entry ${p.entry} -> <span class="text-white">${p.mark||'—'}</span> <span class="${(p.pnl||0)>=0?'text-green-400':'text-red-400'} ml-2">${(p.pnl||0).toFixed(4)}</span></div><div class="text-xs text-cyan-300">SL ${fmtP(p.sl,p.entry)} TP ${fmtP(p.tp,p.entry)}</div></div>`).join('');
+    } else {
+      pel.innerHTML=`<div class="text-gray-500">No open positions. Last PnL: ${st.last_pnl!==undefined?st.last_pnl:'—'}</div>`;
+    }
+  }
+  const cel=document.getElementById('port_closed');
+  if(cel){
+    const cl=st.closed||[];
+    if(cl.length){
+      const closedPnl=cl.reduce((a,c)=>a+(c.pnl||0),0);
+      cel.innerHTML=`<div class="mb-2 text-xs">Closed PnL: <span class="${closedPnl>=0?'text-green-400':'text-red-400'} font-bold">${closedPnl.toFixed(4)}</span> · ${cl.length} trades</div>`+
+        cl.slice(-20).reverse().map(c=>`<div class="flex justify-between py-1 border-b border-gray-800/50"><span>${esc(c.symbol)} <span class="${c.side==='long'?'text-green-400':'text-red-400'}">${esc(c.side)}</span> <span class="text-gray-500 text-xs">${esc(c.closed_reason||'')}</span></span><span class="${(c.pnl||0)>=0?'text-green-400':'text-red-400'}">${(c.pnl||0).toFixed(4)}</span></div>`).join('');
+    } else {
+      cel.innerHTML=`<div class="text-gray-500">No closed trades yet.</div>`;
+    }
+  }
+  // KPIs
+  const pnls=hist.map(x=>x.pnl);
+  document.getElementById('kpi_pnl').textContent='PnL '+((st.combined_pnl!==undefined?st.combined_pnl:(pnls.length?pnls[pnls.length-1]:st.total_pnl||0))).toFixed(4);
+  document.getElementById('kpi_n').textContent=(st.positions||[]).length;
+  const closed=st.closed||[];
+  const wins=closed.filter(c=>(c.pnl||0)>0).length;
+  document.getElementById('kpi_wr').textContent=closed.length?(wins/closed.length*100).toFixed(0)+'%':'—';
+  const allPnls=closed.map(c=>c.pnl||0);
+  document.getElementById('kpi_best').textContent=allPnls.length?Math.max(...allPnls).toFixed(4):'—';
+  // chart
+  const ctx=canvas.getContext('2d');
+  const W=canvas.width,H=canvas.height;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#0a0f1a'; ctx.fillRect(0,0,W,H);
+  if(hist.length<2){ctx.fillStyle='#666';ctx.font='14px monospace';ctx.fillText('No history yet',10,20);return;}
+  const syms=[...new Set(hist.flatMap(h=>Object.keys(h.pos||{})))];
+  const allVals=hist.flatMap(h=>[h.pnl,...Object.values(h.pos||{})]);
+  const min=Math.min(...allVals),max=Math.max(...allVals);
+  const range=(max-min)||1;
+  const padL=50,padR=20,padT=20,padB=30;
+  const pw=W-padL-padR, ph=H-padT-padB;
+  ctx.strokeStyle='#1f2937'; ctx.lineWidth=1;
+  for(let i=0;i<=4;i++){
+    const y=padT+i*ph/4;
+    ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(W-padR,y); ctx.stroke();
+    const v=max-(i/4)*range;
+    ctx.fillStyle='#6b7280'; ctx.font='10px monospace'; ctx.textAlign='right';
+    ctx.fillText(v.toFixed(2),padL-6,y+3);
+  }
+  if(min<0&&max>0){
+    const zy=padT+(1-(0-min)/range)*ph;
+    ctx.strokeStyle='#374151'; ctx.setLineDash([4,4]); ctx.beginPath(); ctx.moveTo(padL,zy); ctx.lineTo(W-padR,zy); ctx.stroke(); ctx.setLineDash([]);
+  }
+  const colors=['#f59e0b','#3b82f6','#a855f7','#ec4899','#14b8a6','#f97316'];
+  // per-position lines
+  syms.forEach((sym,si)=>{
+    ctx.strokeStyle=colors[si%colors.length]; ctx.lineWidth=1.5; ctx.beginPath();
+    let first=true;
+    hist.forEach((x,i)=>{
+      const v=(x.pos||{})[sym];
+      if(v===undefined) return;
+      const px=padL+i/(hist.length-1)*pw;
+      const py=padT+(1-(v-min)/range)*ph;
+      if(first){ctx.moveTo(px,py);first=false;}else ctx.lineTo(px,py);
+    });
+    ctx.stroke();
+  });
+  // total line (bold)
+  ctx.strokeStyle='#00ff88'; ctx.lineWidth=2.5; ctx.beginPath();
+  hist.forEach((x,i)=>{
+    const px=padL+i/(hist.length-1)*pw;
+    const py=padT+(1-(x.pnl-min)/range)*ph;
+    if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+  });
+  ctx.stroke();
+  const lp=hist[hist.length-1].pnl;
+  const lx=padL+pw, ly=padT+(1-(lp-min)/range)*ph;
+  ctx.fillStyle='#00ff88'; ctx.beginPath(); ctx.arc(lx,ly,4,0,Math.PI*2); ctx.fill();
+  // legend
+  ctx.font='10px monospace'; ctx.textAlign='left';
+  let lx0=padL;
+  ctx.fillStyle='#00ff88'; ctx.fillText('TOTAL',lx0,padT-6); lx0+=50;
+  syms.forEach((sym,si)=>{
+    ctx.fillStyle=colors[si%colors.length]; ctx.fillText(sym,lx0,padT-6); lx0+=70;
+  });
+  ctx.fillStyle='#9ca3af'; ctx.font='10px monospace'; ctx.textAlign='left';
+  ctx.fillText('t=0',padL,H-8); ctx.textAlign='right'; ctx.fillText('now',W-padR,H-8);
+  document.getElementById('kpi_pnl').textContent='PnL '+((pnls.length?pnls[pnls.length-1]:0)).toFixed(4);
+  // per-symbol profit histogram
+  const bc=document.getElementById('port_bars');
+  if(bc){
+    const bctx=bc.getContext('2d'); const BW=bc.width,BH=bc.height;
+    bctx.clearRect(0,0,BW,BH); bctx.fillStyle='#0a0f1a'; bctx.fillRect(0,0,BW,BH);
+    const closed=st.closed||[]; const bySym={};
+    for(const c of closed){ bySym[c.symbol]=(bySym[c.symbol]||0)+(c.pnl||0); }
+    // also include open positions current pnl
+    for(const p of (st.positions||[])){ bySym[p.symbol]=(bySym[p.symbol]||0)+(p.pnl||0); }
+    const entries=Object.entries(bySym);
+    if(entries.length){
+      const max=Math.max(...entries.map(e=>Math.abs(e[1])),1);
+      const bw=BW/entries.length;
+      entries.forEach(([sym,val],i)=>{
+        const h=Math.abs(val)/max*(BH-30);
+        const x=i*bw+4; const y=val>=0? (BH/2-h) : (BH/2);
+        bctx.fillStyle=val>=0?'#22c55e':'#ef4444';
+        bctx.fillRect(x,y,bw-8,h);
+        bctx.fillStyle='#9ca3af'; bctx.font='9px monospace'; bctx.textAlign='center';
+        bctx.fillText(sym,x+(bw-8)/2,BH-4);
+      });
+      // zero line
+      bctx.strokeStyle='#374151'; bctx.beginPath(); bctx.moveTo(0,BH/2); bctx.lineTo(BW,BH/2); bctx.stroke();
+    }
+  }
+}
+
+async function showDetail(i){
+  const sigs=window._sigs||[];const d=sigs[i]?.data||{};const name=d.selected_signal;
+  if(!name) return;
+  const r=await fetch('/api/signal_detail?name='+encodeURIComponent(name)).then(x=>x.json());
+  if(r.error){document.getElementById('detail').innerHTML='<div class="text-gray-500">'+esc(r.error)+'</div>';return;}
+  renderDetail(r.signal,r.longs||[],r.shorts||[],r.metrics);
+}
+async function run(){
+  const inp=document.getElementById('inp').value;
+  const btn=document.getElementById('btn');
+  btn.disabled=true;btn.textContent='...';
+  await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input:inp})});
+  setTimeout(()=>{btn.disabled=false;btn.textContent='SCAN'},1500);
+  refresh();
+}
+let _autoTimer=null;
+async function autoStart(){await fetch('/api/auto/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input:document.getElementById('inp').value})}); if(_autoTimer)clearInterval(_autoTimer); _autoTimer=setInterval(async()=>{await refresh();await paperOpen(false);},30000); refresh(); await paperOpen(false);}
+async function autoStop(){await fetch('/api/auto/stop',{method:'POST'}); if(_autoTimer){clearInterval(_autoTimer);_autoTimer=null;} refresh();}
+async function showCard(sym){const c=await fetch('/api/card?symbol='+sym).then(r=>r.json());const lp=await fetch('/api/price?symbol='+sym).then(r=>r.json());const el=document.getElementById('cardbox');const modal=document.getElementById('cardmodal');modal.style.display='flex';el.innerHTML=`<div class="flex justify-between items-center mb-2"><div class="text-cyan-300 font-bold">${esc(c.symbol)}</div><button onclick="document.getElementById('cardmodal').style.display='none';if(window._live)clearInterval(window._live);" class="text-xs text-gray-400 hover:text-white">✕ CLOSE</button></div><div class="mb-2 text-sm font-bold ${lp.price>c.sma20?'text-green-400':'text-red-400'}">DECISION: ${lp.price>c.sma20?'LONG':'SHORT'} (conf ${c.conf})</div><div class="grid grid-cols-2 gap-2 text-xs"><div>Price (live): <span id="liveprice" class="metric" style="font-size:14px">${lp.price}</span></div><div>24h: <span class="${c.change24>=0?'text-green-400':'text-red-400'}">${c.change24}%</span></div><div>7d: <span class="${c.trend7>=0?'text-green-400':'text-red-400'}">${c.trend7}%</span></div><div>SMA20: ${c.sma20}</div><div>20d High: ${c.high20}</div><div>20d Low: ${c.low20}</div><div>Avg Vol: ${c.avgvol}</div><div>Suggested size: <span class="text-cyan-400">${c.pos}x</span></div></div><div class="text-xs text-gray-400 mt-2">Rationale: price ${lp.price>c.sma20?'above':'below'} SMA20 → ${lp.price>c.sma20?'momentum up, enter long':'mean-reversion down, enter short'}.</div>`;if(window._live)clearInterval(window._live);window._live=setInterval(async()=>{const p=await fetch('/api/price?symbol='+sym).then(r=>r.json());const e=document.getElementById('liveprice');if(e)e.textContent=p.price;},3000);
+}
+// ---------------- EVOLUTION TAB ----------------
+function fnum(x,d){const n=Number(x);return (x===null||x===undefined||isNaN(n))?'—':n.toFixed(d)}
+let _evoData=null,_evoMetrics=null,_evoRun=null,_evoRunDetail=null,_evoSel=null,_evoLoaded=false;
+async function renderEvolution(force){
+  const strip=document.getElementById('evo_strip');
+  if(!_evoLoaded||force){
+    strip.innerHTML='<span class="text-gray-500 text-xs tracking-widest">LOADING EVOLUTION DATA…</span>';
+    try{
+      const [e,m]=await Promise.all([fetch('/api/evolution').then(r=>r.json()),fetch('/api/metrics/summary').then(r=>r.json()).catch(()=>null)]);
+      _evoData=e;_evoMetrics=m;_evoLoaded=true;
+    }catch(err){strip.innerHTML='<span class="text-red-400 text-xs tracking-widest">EVOLUTION LOAD FAILED: '+esc(err)+'</span>';return;}
+  }
+  renderEvoStrip();renderEvoRuns();
+  const runs=(_evoData&&_evoData.runs)||[];
+  if(!_evoRun||!runs.some(r=>r.run_id===_evoRun)){
+    if(runs.length) evoSelectRun(runs[0].run_id);
+    else{document.getElementById('evo_tree').innerHTML='<div class="text-gray-500 text-xs py-6">NO RUNS YET — INITIATE SCAN</div>';document.getElementById('evo_detail').innerHTML='<div class="text-gray-500 text-xs">NO RUNS YET</div>';}
+  }
+}
+function evoIcClass(ic){if(ic===null||ic===undefined)return '';const a=Math.abs(ic);if(a>=0.02)return ic>=0?'strong':'neg';return 'weak';}
+function evoIcText(ic){const c=evoIcClass(ic);return c==='strong'?'text-green-400':c==='neg'?'text-red-400':c==='weak'?'text-yellow-500':'text-gray-400';}
+function renderEvoStrip(){
+  const el=document.getElementById('evo_strip');
+  const s=(_evoData&&_evoData.summary)||{};
+  const avail=(_evoMetrics&&_evoMetrics.metric_availability)||{};
+  const tot=s.total_signals??0;
+  const chips=['sharpe_ratio','sortino_ratio','max_drawdown','calmar_ratio','turnover','overfit_risk']
+    .filter(k=>avail[k]).map(k=>`<span class="evo-badge" style="border-color:#374151;color:#9ca3af">${esc(k.replace(/_/g,' ').toUpperCase())} ${avail[k].count}/${tot}</span>`).join(' ');
+  el.innerHTML=`<div class="flex items-center justify-between flex-wrap gap-2">
+    <div class="flex items-center gap-5 flex-wrap">
+      <div><div class="text-xs text-gray-500 tracking-widest">RUNS</div><div class="metric" style="font-size:16px">${s.total_runs??0}</div></div>
+      <div><div class="text-xs text-gray-500 tracking-widest">SIGNALS</div><div class="metric" style="font-size:16px">${tot}</div></div>
+      <div><div class="text-xs text-gray-500 tracking-widest">ACCEPTED</div><div class="metric" style="font-size:16px;color:#00ff88">${s.accepted_count??0}</div></div>
+      <div><div class="text-xs text-gray-500 tracking-widest">BEST IC</div><div class="metric ${evoIcText(s.best_ic)}" style="font-size:16px">${fnum(s.best_ic,4)}</div></div>
+      <div><div class="text-xs text-gray-500 tracking-widest">OVERFIT</div><div class="metric" style="font-size:16px;color:${(s.overfit_count||0)>0?'#ff4444':'#6b7280'}">${s.overfit_count??0}</div></div>
+      <div class="text-xs text-gray-400 tracking-widest max-w-xs truncate">${s.best_signal?esc(s.best_signal):''}</div>
+    </div>
+    <div class="text-right">
+      <div class="text-xs text-gray-500 tracking-widest mb-1">METRIC AVAILABILITY</div>
+      <div>${chips||'<span class="text-gray-600 text-xs">no portfolio metrics yet — appear after new runs</span>'}</div>
+    </div>
+  </div>`;
+}
+function renderEvoRuns(){
+  const el=document.getElementById('evo_runs');
+  const runs=(_evoData&&_evoData.runs)||[];
+  const q=(document.getElementById('evo_filter').value||'').toLowerCase();
+  document.getElementById('evo_runs_count').textContent=runs.length+' SHOWN';
+  el.innerHTML=runs.filter(r=>{
+    if(!q)return true;
+    const hay=(r.run_id+' '+(r.request||'')+' '+r.iterations.map(n=>n.signal_name||'').join(' ')).toLowerCase();
+    return hay.includes(q);
+  }).map(r=>{
+    const b=r.best||{};const cls=evoIcClass(b.mean_ic);
+    const acc=r.status==='accepted';
+    return `<div class="evo-run ${_evoRun===r.run_id?'sel':''}" onclick="evoSelectRun('${escJs(r.run_id)}')">
+      <div class="flex justify-between items-center gap-2">
+        <div class="text-xs font-bold text-cyan-300 truncate" style="font-family:'Orbitron',sans-serif">${esc(r.run_id)}</div>
+        <span class="evo-badge" style="border-color:${acc?'#00ff88':'#f59e0b'};color:${acc?'#00ff88':'#f59e0b'};flex:none">${acc?'ACCEPTED':'BEST'}</span>
+      </div>
+      <div class="text-xs text-gray-500 mt-1 truncate">${esc(r.started_at?r.started_at.replace('T',' '):'—')}</div>
+      <div class="flex justify-between text-xs mt-1">
+        <span class="text-gray-400">${r.iterations.length} iter</span>
+        <span class="${evoIcText(b.mean_ic)}">IC ${fnum(b.mean_ic,4)}</span>
+      </div>
+    </div>`;
+  }).join('')||'<div class="text-gray-500 text-center py-6">NO RUNS</div>';
+}
+async function evoSelectRun(id){
+  _evoRun=id;_evoSel=null;renderEvoRuns();
+  const treeEl=document.getElementById('evo_tree');
+  treeEl.innerHTML='<div class="text-gray-500 text-xs py-4">LOADING RUN…</div>';
+  try{ _evoRunDetail=await fetch('/api/evolution/'+encodeURIComponent(id)).then(r=>r.json()); }
+  catch(e){ treeEl.innerHTML='<div class="text-red-400 text-xs">LOAD FAILED: '+esc(e)+'</div>'; return; }
+  if(_evoRunDetail.error){ treeEl.innerHTML='<div class="text-red-400 text-xs">'+esc(_evoRunDetail.error)+'</div>'; return; }
+  renderEvoTree();
+  const nodes=_evoRunDetail.iterations||[];
+  if(nodes.length) evoShowNode((_evoRunDetail.best||nodes[nodes.length-1]).id);
+}
+function evoBadge(n){
+  const map={seed:['SEED','#00e5ff'],optimization_feedback:['FEEDBACK','#f59e0b'],seed_feedback:['FEEDBACK','#f59e0b'],genetic_crossover:['CROSSOVER','#a855f7'],resumed:['RESUMED','#00e5ff']};
+  const b=map[String(n.source||'').toLowerCase()];
+  return b?`<span class="evo-badge" style="border-color:${b[1]};color:${b[1]}">${b[0]}</span>`:'';
+}
+// ---- SKEPTIC REVIEW rendering (values are LLM-derived: ALWAYS esc() them) ----
+function evoSkepticCounts(n){
+  const rv=n.skeptic_reviews||[];
+  return {rej:rv.filter(v=>v&&v.verdict==='reject').length,
+          app:rv.filter(v=>v&&v.verdict==='approve').length,
+          total:rv.length};
+}
+function evoSkepticReason(rv){ // first reason/issues line, whitespace-collapsed, <=120 chars
+  if(!rv||typeof rv!=='object')return '';
+  const first=(Array.isArray(rv.reasons)&&rv.reasons[0])||(Array.isArray(rv.issues)&&rv.issues[0])||(Array.isArray(rv.static_risks)&&rv.static_risks[0])||'';
+  const s=String(first??'').replace(/\s+/g,' ').trim();
+  return s.length>120?s.slice(0,120)+'…':s;
+}
+function evoSkepticCard(n){ // compact one-liner on the node card; NOTHING when no reviews
+  if(!n.skeptic_reviews||!n.skeptic_reviews.length)return '';
+  const c=evoSkepticCounts(n);
+  const parts=[];
+  if(c.rej)parts.push(`<span style="color:#ff4444">SKEPTIC ✕${c.rej}</span>`);
+  if(c.app)parts.push(`<span style="color:#00ff88">✓${c.app}</span>`);
+  if(!parts.length)parts.push(`<span class="text-gray-500">SKEPTIC ${c.total}</span>`);
+  return `<div class="mt-1 text-xs" style="font-family:'Orbitron',sans-serif;letter-spacing:.06em">${parts.join(' · ')}</div>`;
+}
+function evoSkepticBlock(n){ // detail-panel summary: counts + one line per rejected candidate
+  const rv=n.skeptic_reviews||[];
+  const c=evoSkepticCounts(n);
+  const rejLines=rv.filter(v=>v&&v.verdict==='reject').map(v=>
+    `<div class="text-xs py-0.5" style="color:#ff4444">✕ ${esc(String((v&&v.name)||'unknown'))} — ${esc(evoSkepticReason(v))||'<span class="text-gray-600">no reason given</span>'}</div>`).join('');
+  return `<div class="text-xs text-gray-400 tracking-widest mb-1">SKEPTIC · ${c.rej} rejected · ${c.app} approved</div>`+
+    (rejLines||'<div class="text-xs py-0.5" style="color:#00ff88">✓ all candidates approved</div>');
+}
+function evoOverfitBadge(n){return (n.overfit||n.oos_is_overfit)?`<span class="evo-badge" style="border-color:#ff4444;color:#ff4444">OVERFIT</span>`:'';}
+function evoAcceptBadge(n){
+  if(n.accepted===null||n.accepted===undefined)return '';
+  return n.accepted?`<span class="evo-badge" style="border-color:#00ff88;color:#00ff88">OK</span>`:`<span class="evo-badge" style="border-color:#374151;color:#6b7280">REJ</span>`;
+}
+function evoNodeCard(n){
+  const cls=evoIcClass(n.mean_ic);
+  return `<div class="evo-node ${cls} ${_evoSel===n.id?'sel':''}" onclick="evoShowNode('${escJs(n.id)}')">
+    <div class="flex items-center justify-between gap-2">
+      <span class="text-gray-500 text-xs font-bold" style="font-family:'Orbitron',sans-serif">IT${n.iteration}</span>
+      <span>${evoBadge(n)}${evoOverfitBadge(n)}</span>
+    </div>
+    <div class="text-cyan-300 font-bold text-xs mt-1 truncate" title="${esc(n.signal_name||'')}">${esc(n.signal_name||'—')}</div>
+    <div class="grid grid-cols-2 gap-x-2 mt-1 text-xs">
+      <div class="text-gray-500">IC <span class="${evoIcText(n.mean_ic)}">${fnum(n.mean_ic,4)}</span></div>
+      <div class="text-gray-500">p <span class="text-gray-300">${fnum(n.p_value,4)}</span></div>
+      <div class="text-gray-500">IR <span class="text-gray-300">${fnum(n.ic_ir,4)}</span></div>
+      <div class="text-gray-500">t <span class="text-gray-300">${fnum(n.t_stat,2)}</span></div>
+    </div>
+    <div class="mt-1">${evoAcceptBadge(n)}</div>
+    ${evoSkepticCard(n)}
+  </div>`;
+}
+function evoRenderSubtree(n){
+  const kids=n.children||[];
+  if(!kids.length) return evoNodeCard(n);
+  return `<div class="flex items-center">
+    ${evoNodeCard(n)}
+    <div class="evo-link"></div>
+    <div class="flex flex-col ${kids.length>1?'evo-branch':''}" style="gap:14px">
+      ${kids.map(k=>`<div class="flex items-center">${kids.length>1?'<div class="evo-link" style="width:12px"></div>':''}${evoRenderSubtree(k)}</div>`).join('')}
+    </div>
+  </div>`;
+}
+function renderEvoTree(){
+  const d=_evoRunDetail;const root=(d&&d.tree&&d.tree.root)||null;
+  document.getElementById('evo_tree_title').textContent=d?d.run_id:'';
+  const el=document.getElementById('evo_tree');
+  if(!root){el.innerHTML='<div class="text-gray-500 text-xs py-6">EMPTY RUN</div>';return;}
+  if(root.id===null){
+    el.innerHTML='<div class="text-gray-500 text-xs mb-2">MULTIPLE ROOTS (parents outside run)</div>'+(root.children||[]).map(c=>`<div class="mb-4">${evoRenderSubtree(c)}</div>`).join('');
+  } else {
+    el.innerHTML=evoRenderSubtree(root);
+  }
+}
+function evoShowNode(id){
+  const d=_evoRunDetail;if(!d)return;
+  const n=(d.iterations||[]).find(x=>x.id===id);
+  if(!n)return;
+  _evoSel=id;renderEvoTree();
+  const el=document.getElementById('evo_detail');
+  const descs=n.descriptors||[];
+  const m=n.metrics||{};
+  const rows=[['Mean IC',n.mean_ic,1],['IC IR',n.ic_ir,0],['t-stat',n.t_stat,0],['p-value',n.p_value,0],
+    ['Sharpe',m.sharpe_ratio,0],['Sortino',m.sortino_ratio,0],['Max DD',m.max_drawdown,0],['Calmar',m.calmar_ratio,0],['Turnover',m.turnover,0]];
+  const mrows=rows.map(r=>`<tr><td class="text-gray-500 tracking-widest">${r[0]}</td><td class="text-right ${r[2]?evoIcText(r[1]):'text-gray-200'}">${fnum(r[1],4)}</td></tr>`).join('');
+  const known=new Set(['mean_ic','ic_ir','t_stat','p_value','sharpe_ratio','sortino_ratio','max_drawdown','calmar_ratio','turnover','num_periods','positive_ic_ratio','ic_std']);
+  const extra=Object.keys(m).filter(k=>!known.has(k)).map(k=>`<tr><td class="text-gray-500">${esc(k)}</td><td class="text-right text-gray-200">${esc(m[k])}</td></tr>`).join('');
+  el.innerHTML=`
+    <div class="text-cyan-300 font-bold text-sm mb-1" style="font-family:'Orbitron',sans-serif">${esc(n.signal_name||'—')}</div>
+    <div class="text-xs text-gray-500 mb-2">iteration ${n.iteration} · ${esc(n.timestamp||n.ts_iso||'—')} · ${n.code_len||0} chars of code</div>
+    <div class="mb-2">${evoBadge(n)} ${evoAcceptBadge(n)} ${evoOverfitBadge(n)}</div>
+    <table class="evo-table mb-3">${mrows}${extra}</table>
+    <div class="text-xs text-gray-400 tracking-widest mb-1">FORMULA</div>
+    ${descs.length?descs.map(dd=>`<div class="mb-2 p-2 rounded border border-gray-800 bg-gray-900/50 text-xs"><span class="text-gray-500 mr-2">${esc(dd.category||'')}</span><span class="text-cyan-300 font-mono">${esc(dd.formula||dd.name||'—')}</span></div>`).join(''):'<div class="text-gray-600 text-xs mb-2">—</div>'}
+    <div class="text-xs text-gray-400 tracking-widest mb-1">LINEAGE</div>
+    <div class="text-xs text-gray-300 mb-3">parent: <span class="text-cyan-300">${esc(n.parent_signal||'—')}</span> · source: <span class="text-cyan-300">${esc(n.source||'—')}</span>${n.parent_run_id?` · parent run: <span class="text-cyan-300">${esc(n.parent_run_id)}</span>`:''}</div>
+    ${(n.skeptic_reviews&&n.skeptic_reviews.length)?`<div class="mb-3">${evoSkepticBlock(n)}</div>`:''}
+    ${n.feedback?`<div class="text-xs text-gray-400 tracking-widest mb-1">OPTIMIZATION FEEDBACK</div><pre class="text-xs text-yellow-200/80 whitespace-pre-wrap mb-3 max-h-40 overflow-auto p-2 rounded border border-gray-800 bg-black/40">${esc(n.feedback)}</pre>`:''}
+    <details ${n.code?'open':''}>
+      <summary class="text-xs text-cyan-400 cursor-pointer tracking-widest mb-1" style="font-family:'Orbitron',sans-serif">GENERATED CODE</summary>
+      ${n.code?`<pre class="text-xs font-mono text-green-300 whitespace-pre-wrap leading-relaxed max-h-80 overflow-auto p-2 rounded border border-gray-800 bg-black/40 mt-1">${esc(n.code)}</pre>`:'<div class="text-gray-600 text-xs">no code</div>'}
+    </details>`;
+}
+setInterval(refresh,4000);refresh();
+</script>
+</body>
+</html>

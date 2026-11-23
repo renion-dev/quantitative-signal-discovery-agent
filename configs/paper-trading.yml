@@ -1,0 +1,45 @@
+# Paper-trading limits for the dashboard (dashboard/app.py).
+# The file is optional: when it is missing, the defaults below are used.
+#
+# Maximum number of simultaneously open positions.
+max_open_positions: 3
+
+# Starting capital of the paper account, in USDT. The percentage limit is
+# relative to the free balance:
+#   free_balance = starting_balance + realized_pnl - open_notional
+# where realized_pnl is the sum of closed trades and open_notional is the
+# sum of |qty * entry| over the currently open positions.
+starting_balance: 10000
+
+# Maximum notional for a single position. Both may be set; the stricter
+# (lower) limit applies. Leave null to disable that limit.
+#   max_position_size_pct:    percent of the free balance (e.g. 25)
+#   max_position_size_amount: fixed nominal amount in USDT (e.g. 1000)
+max_position_size_pct: 25
+max_position_size_amount: null
+
+# Maximum number of simultaneously open positions in ONE direction (long or
+# short). This is a concentration control and always applies, independently of
+# the market regime. null disables the per-side cap.
+max_positions_per_side: 2
+
+# Consider the market regime when deciding direction and size.
+#
+# The regime combines two independent sources and is directional only when
+# they agree:
+#   * proxy    - daily candles of regime_symbol, fast SMA vs slow SMA
+#                 (bull / bear / sideways)
+#   * consensus- balance and strength of the buy/sell candidates
+#                 (bull / bear / neutral)
+# Both bull -> bullish, both bear -> bearish, otherwise neutral.
+market_regime_filter: true
+
+# Size multiplier applied to a signal that goes AGAINST a non-neutral market
+# regime (0.5 = half size). 1.0 disables the reduction.
+regime_size_reduction: 0.5
+
+# Instrument used as the market-regime proxy.
+regime_symbol: BTCUSDT
+# SMA windows (in daily candles) used to classify the regime.
+regime_fast_sma: 20
+regime_slow_sma: 60
