@@ -12,6 +12,9 @@ src/signal_discovery_workflow/data/binance_futures/*.csv
 # Jupyter auto-saved checkpoints
 notebooks/.ipynb_checkpoints/
 
+# Dashboard runtime state (paper-trading positions, rewritten on every run)
+dashboard/paper.json
+
 # Secrets — never commit API keys.
 .env
 .env.local
