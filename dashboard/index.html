@@ -253,11 +253,20 @@ async function refresh(){
   const perPosition=(hasPct||hasAmount)?(hasPct?esc(pctLimit)+'% of free balance':'')+(hasPct&&hasAmount?' · ':'')+(hasAmount?esc(amountLimit)+' USDT':''):'No per-position notional limit';
   const lastOpen=window._paperOpenResult||{};
   const skipped=Array.isArray(lastOpen.skipped)?lastOpen.skipped:[];
+  const sideCounts=paper.side_counts||{};
+  const perSide=(limits.max_positions_per_side===null||limits.max_positions_per_side===undefined)?'—':limits.max_positions_per_side;
+  const regimeInfo=lastOpen.regime||paper.regime||null;
+  const regimeOn=!!(regimeInfo&&regimeInfo.enabled!==false);
+  const regimeCombined=regimeInfo?(regimeOn?(regimeInfo.combined||'neutral'):'off'):'—';
+  const regimeBtc=regimeInfo?(regimeOn?(regimeInfo.btc||'unknown'):'—'):'—';
+  const regimeCons=regimeInfo?(regimeOn?(regimeInfo.consensus||'neutral'):'—'):'—';
   const configError=paper.config_error?`CONFIG ERROR: ${esc(paper.error||'invalid paper-trading config')}`:'';
   pel.innerHTML=`<div class="mb-2 p-2 border border-gray-700 rounded">
     <div>Open positions: <span class="font-bold text-cyan-300">${esc(openCount)}</span> / ${esc(maxOpen)}</div>
     <div class="text-gray-400 mt-1">Starting balance: ${esc(starting)} USDT</div>
     <div class="text-gray-400 mt-1">Max per position: ${esc(perPosition)}</div>
+    <div class="text-gray-400 mt-1">Side cap: ${esc(sideCounts.long||0)} long · ${esc(sideCounts.short||0)} short (max ${esc(perSide)} per side)</div>
+    <div class="text-gray-400 mt-1">Market regime: <span class="text-cyan-300">${esc(regimeCombined)}</span> · proxy ${esc(regimeBtc)} · consensus ${esc(regimeCons)}</div>
     ${configError?`<div class="text-red-400 mt-1">${esc(configError)}</div>`:''}
   </div>
   ${paperPositions.length?`<div class="mb-2">Total PnL: <span class="${(paper.total_pnl||0)>=0?'text-green-400':'text-red-400'} font-bold">${(paper.total_pnl||0).toFixed(4)}</span></div>`:''}

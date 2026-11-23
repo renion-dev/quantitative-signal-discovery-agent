@@ -28,8 +28,18 @@ from typing import Any
 
 DEFAULT_MAX_OPEN_POSITIONS = 3
 DEFAULT_STARTING_BALANCE = 10000.0
+DEFAULT_MAX_POSITIONS_PER_SIDE = None
+DEFAULT_MARKET_REGIME_FILTER = False
+DEFAULT_REGIME_SIZE_REDUCTION = 0.5
+DEFAULT_REGIME_SYMBOL = "BTCUSDT"
+DEFAULT_REGIME_FAST_SMA = 20
+DEFAULT_REGIME_SLOW_SMA = 60
 CONFIG_ENV_VAR = "PAPER_TRADING_CONFIG"
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Relative distance between the fast and slow simple moving average below which the market is
+#: treated as sideways instead of trending. ``abs(fast - slow) / slow <= REGIME_SIDEWAYS_EPSILON``.
+REGIME_SIDEWAYS_EPSILON = 0.002
 
 _ALLOWED_CONFIG_KEYS = frozenset(
     {
@@ -37,6 +47,12 @@ _ALLOWED_CONFIG_KEYS = frozenset(
         "starting_balance",
         "max_position_size_pct",
         "max_position_size_amount",
+        "max_positions_per_side",
+        "market_regime_filter",
+        "regime_size_reduction",
+        "regime_symbol",
+        "regime_fast_sma",
+        "regime_slow_sma",
     }
 )
 
@@ -53,6 +69,12 @@ class PaperConfig:
     starting_balance: float = DEFAULT_STARTING_BALANCE
     max_position_size_pct: float | None = None
     max_position_size_amount: float | None = None
+    max_positions_per_side: int | None = DEFAULT_MAX_POSITIONS_PER_SIDE
+    market_regime_filter: bool = DEFAULT_MARKET_REGIME_FILTER
+    regime_size_reduction: float = DEFAULT_REGIME_SIZE_REDUCTION
+    regime_symbol: str = DEFAULT_REGIME_SYMBOL
+    regime_fast_sma: int = DEFAULT_REGIME_FAST_SMA
+    regime_slow_sma: int = DEFAULT_REGIME_SLOW_SMA
     path: Path | None = None
     file_missing: bool = False
     warnings: tuple[str, ...] = ()
@@ -80,7 +102,9 @@ def _parse_flat_yaml(text: str) -> dict[str, Any]:
     """Parse the small, flat YAML subset used by the paper config.
 
     This fallback is intentionally conservative. It supports comments, nulls, booleans, and numeric
-    scalars, while rejecting nested YAML structures and malformed ``key: value`` lines.
+    scalars, while rejecting nested YAML structures and malformed ``key: value`` lines. The boolean
+    spellings match YAML 1.1 (``true``/``false``, ``yes``/``no``, ``on``/``off``) so that a config
+    file behaves identically whether PyYAML is installed or not.
     """
 
     values: dict[str, Any] = {}
@@ -102,9 +126,9 @@ def _parse_flat_yaml(text: str) -> dict[str, Any]:
             value: Any = ""
         elif value_text.lower() in {"null", "~"}:
             value = None
-        elif value_text.lower() == "true":
+        elif value_text.lower() in {"true", "yes", "on"}:
             value = True
-        elif value_text.lower() == "false":
+        elif value_text.lower() in {"false", "no", "off"}:
             value = False
         elif re.fullmatch(r"[+-]?\d+", value_text):
             value = int(value_text)
@@ -174,6 +198,45 @@ def _validate_positive_number(value: Any, key: str, path: Path) -> float:
     return number
 
 
+def _validate_optional_non_negative_integer(value: Any, key: str, path: Path) -> int | None:
+    """Validate an optional non-negative integer setting (``null`` disables the setting)."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PaperConfigError(f"{key} must be null or a non-negative integer")
+    return value
+
+
+def _validate_bool(value: Any, key: str, path: Path) -> bool:
+    if not isinstance(value, bool):
+        raise PaperConfigError(f"{key} must be true or false")
+    return value
+
+
+def _validate_fraction(value: Any, key: str, path: Path) -> float:
+    """Validate a size multiplier in the ``(0, 1]`` range."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PaperConfigError(f"{key} must be a number greater than zero and at most one")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0 or number > 1:
+        raise PaperConfigError(f"{key} must be a finite number greater than zero and at most one")
+    return number
+
+
+def _validate_non_empty_string(value: Any, key: str, path: Path) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PaperConfigError(f"{key} must be a non-empty string")
+    return value.strip()
+
+
+def _validate_positive_integer(value: Any, key: str, path: Path) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise PaperConfigError(f"{key} must be a positive integer")
+    return value
+
+
 def load_paper_config(path: str | Path | None = None) -> PaperConfig:
     """Load and validate the paper-trading configuration.
 
@@ -228,11 +291,50 @@ def load_paper_config(path: str | Path | None = None) -> PaperConfig:
         else _validate_positive_number(raw_amount, "max_position_size_amount", resolved_path)
     )
 
+    max_positions_per_side = _validate_optional_non_negative_integer(
+        raw_config.get("max_positions_per_side", DEFAULT_MAX_POSITIONS_PER_SIDE),
+        "max_positions_per_side",
+        resolved_path,
+    )
+    market_regime_filter = _validate_bool(
+        raw_config.get("market_regime_filter", DEFAULT_MARKET_REGIME_FILTER),
+        "market_regime_filter",
+        resolved_path,
+    )
+    regime_size_reduction = _validate_fraction(
+        raw_config.get("regime_size_reduction", DEFAULT_REGIME_SIZE_REDUCTION),
+        "regime_size_reduction",
+        resolved_path,
+    )
+    regime_symbol = _validate_non_empty_string(
+        raw_config.get("regime_symbol", DEFAULT_REGIME_SYMBOL),
+        "regime_symbol",
+        resolved_path,
+    )
+    regime_fast_sma = _validate_positive_integer(
+        raw_config.get("regime_fast_sma", DEFAULT_REGIME_FAST_SMA),
+        "regime_fast_sma",
+        resolved_path,
+    )
+    regime_slow_sma = _validate_positive_integer(
+        raw_config.get("regime_slow_sma", DEFAULT_REGIME_SLOW_SMA),
+        "regime_slow_sma",
+        resolved_path,
+    )
+    if regime_fast_sma >= regime_slow_sma:
+        raise PaperConfigError("regime_fast_sma must be smaller than regime_slow_sma")
+
     return PaperConfig(
         max_open_positions=max_open_positions,
         starting_balance=starting_balance,
         max_position_size_pct=max_position_size_pct,
         max_position_size_amount=max_position_size_amount,
+        max_positions_per_side=max_positions_per_side,
+        market_regime_filter=market_regime_filter,
+        regime_size_reduction=regime_size_reduction,
+        regime_symbol=regime_symbol,
+        regime_fast_sma=regime_fast_sma,
+        regime_slow_sma=regime_slow_sma,
         path=resolved_path,
         warnings=tuple(warning_messages),
         unknown_keys=unknown_keys,
@@ -305,6 +407,195 @@ def _round_quantity_down(quantity: float) -> float:
     """Round a positive quantity down to eight decimal places."""
 
     return math.floor(quantity * 100_000_000) / 100_000_000
+
+
+def classify_sma_regime(
+    closes: Sequence[float],
+    fast: int = DEFAULT_REGIME_FAST_SMA,
+    slow: int = DEFAULT_REGIME_SLOW_SMA,
+) -> dict[str, Any]:
+    """Classify the market regime from daily close prices using two simple moving averages.
+
+    The fast window sits above the slow window in an uptrend and below it in a downtrend. The
+    market is treated as sideways when the two averages are within
+    ``REGIME_SIDEWAYS_EPSILON`` relative distance of each other, that is
+    ``abs(fast_sma - slow_sma) / slow_sma <= REGIME_SIDEWAYS_EPSILON``.
+
+    Args:
+        closes: Daily close prices ordered from oldest to newest.
+        fast: Length of the fast moving-average window.
+        slow: Length of the slow moving-average window.
+
+    Returns:
+        A mapping with the regime (``bull``, ``bear``, ``sideways`` or ``unknown``), both moving
+        averages, and the number of usable samples. The regime is ``unknown`` when there are
+        fewer than ``slow`` samples or when any input value is not a finite number.
+    """
+
+    unknown: dict[str, Any] = {
+        "regime": "unknown",
+        "fast_sma": None,
+        "slow_sma": None,
+        "samples": 0,
+    }
+    if not isinstance(fast, int) or isinstance(fast, bool) or fast <= 0:
+        raise ValueError("fast must be a positive integer")
+    if not isinstance(slow, int) or isinstance(slow, bool) or slow <= 0:
+        raise ValueError("slow must be a positive integer")
+    if fast >= slow:
+        raise ValueError("fast must be smaller than slow")
+
+    values: list[float] = []
+    for close in closes or []:
+        number = _finite_number(close)
+        if number is None:
+            return unknown
+        values.append(number)
+
+    if len(values) < slow:
+        unknown["samples"] = len(values)
+        return unknown
+
+    fast_sma = sum(values[-fast:]) / fast
+    slow_sma = sum(values[-slow:]) / slow
+    if not math.isfinite(fast_sma) or not math.isfinite(slow_sma) or slow_sma <= 0:
+        return unknown
+
+    relative_distance = abs(fast_sma - slow_sma) / slow_sma
+    if relative_distance <= REGIME_SIDEWAYS_EPSILON:
+        regime = "sideways"
+    elif fast_sma > slow_sma:
+        regime = "bull"
+    else:
+        regime = "bear"
+    return {
+        "regime": regime,
+        "fast_sma": fast_sma,
+        "slow_sma": slow_sma,
+        "samples": len(values),
+    }
+
+
+def _row_net(row: Any) -> float:
+    """Return the finite ``net`` vote of a consensus row, or zero when it is missing."""
+
+    if not isinstance(row, Mapping):
+        return 0.0
+    return _finite_number(row.get("net")) or 0.0
+
+
+def classify_consensus_regime(summary: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Classify the consensus regime from the balance and strength of the candidate lists.
+
+    The consensus summary produced by the dashboard contains ``top_buy`` and ``top_sell`` rows
+    with a ``net`` vote per symbol. The buy strength is the sum of the positive ``net`` votes of
+    the buy candidates and the sell strength is the sum of the absolute negative ``net`` votes of
+    the sell candidates.
+
+    The regime is ``bull`` when the buy strength is larger, ``bear`` when the sell strength is
+    larger, and ``neutral`` when both strengths are equal. The candidate counts break an exact
+    strength tie, and an empty or malformed summary is ``neutral``.
+
+    Returns:
+        A mapping with the regime (``bull``, ``bear`` or ``neutral``), both candidate counts and
+        both strengths.
+    """
+
+    result: dict[str, Any] = {
+        "regime": "neutral",
+        "buy_count": 0,
+        "sell_count": 0,
+        "buy_strength": 0.0,
+        "sell_strength": 0.0,
+    }
+    if not isinstance(summary, Mapping):
+        return result
+
+    buy_rows = summary.get("top_buy") or []
+    sell_rows = summary.get("top_sell") or []
+    if not isinstance(buy_rows, Sequence) or isinstance(buy_rows, (str, bytes)):
+        buy_rows = []
+    if not isinstance(sell_rows, Sequence) or isinstance(sell_rows, (str, bytes)):
+        sell_rows = []
+
+    buy_strength = sum(max(_row_net(row), 0.0) for row in buy_rows)
+    sell_strength = sum(abs(min(_row_net(row), 0.0)) for row in sell_rows)
+    buy_count = len(buy_rows)
+    sell_count = len(sell_rows)
+
+    if buy_strength > sell_strength:
+        regime = "bull"
+    elif sell_strength > buy_strength:
+        regime = "bear"
+    elif buy_count > sell_count:
+        regime = "bull"
+    elif sell_count > buy_count:
+        regime = "bear"
+    else:
+        regime = "neutral"
+
+    result.update(
+        {
+            "regime": regime,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "buy_strength": buy_strength,
+            "sell_strength": sell_strength,
+        }
+    )
+    return result
+
+
+def combine_regimes(btc_regime: str | None, consensus_regime: str | None) -> dict[str, Any]:
+    """Combine the independent market regime and the consensus regime.
+
+    Only agreement produces a directional regime: both sources must be ``bull`` for ``bullish``
+    and both must be ``bear`` for ``bearish``. A disagreement, a neutral source, or an unknown
+    source yields ``neutral``.
+
+    Returns:
+        A mapping with the combined regime and both contributing regimes.
+    """
+
+    btc = (btc_regime or "unknown").lower()
+    consensus = (consensus_regime or "neutral").lower()
+    if btc == "bull" and consensus == "bull":
+        combined = "bullish"
+    elif btc == "bear" and consensus == "bear":
+        combined = "bearish"
+    else:
+        combined = "neutral"
+    return {"combined": combined, "btc": btc, "consensus": consensus}
+
+
+def regime_alignment(side: str, regime: str | None) -> str:
+    """Return how a candidate side relates to the combined market regime.
+
+    Returns:
+        ``aligned`` when the trade goes with the regime, ``counter`` when it goes against it, and
+        ``neutral`` when the regime is neutral, unknown, or not directional.
+    """
+
+    direction = (side or "").strip().lower()
+    combined = (regime or "").strip().lower()
+    if combined == "bullish":
+        return "aligned" if direction == "long" else "counter"
+    if combined == "bearish":
+        return "aligned" if direction == "short" else "counter"
+    return "neutral"
+
+
+def side_counts(open_positions: Sequence[Mapping[str, Any]] | None) -> dict[str, int]:
+    """Count the currently open positions per side."""
+
+    counts = {"long": 0, "short": 0}
+    for position in open_positions or []:
+        if not isinstance(position, Mapping):
+            continue
+        side = str(position.get("side", "")).strip().lower()
+        if side in counts:
+            counts[side] += 1
+    return counts
 
 
 def size_position_qty(
@@ -387,6 +678,9 @@ def select_open_candidates(
     *,
     paper_state: Mapping[str, Any] | None = None,
     base_qty: float = 1.0,
+    regime: str | None = None,
+    regime_size_reduction: float = 1.0,
+    max_positions_per_side: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Select and size new paper positions while enforcing the hard position-count limit.
 
@@ -394,6 +688,18 @@ def select_open_candidates(
     a missing price or a rejected size consumes no slot. When a percentage limit is configured,
     the cap is recalculated from the free balance before each candidate, so opening one position
     reduces the allowance for the next one.
+
+    Three optional controls are applied when they are configured:
+
+    * ``max_positions_per_side`` caps the number of simultaneously open positions in one
+      direction. A candidate that would exceed the cap is skipped with ``side_limit_reached``.
+      The cap counts the already open positions of that side plus the ones accepted in this run.
+    * ``regime`` is the combined market regime (``bullish`` or ``bearish``). Candidates that go
+      with the regime are evaluated first, so a scarce slot goes to the trade that agrees with
+      the market. The relative order inside each group is preserved, and with a neutral or
+      missing regime the supplied order is kept exactly.
+    * ``regime_size_reduction`` scales the permitted quantity of a candidate that goes against a
+      directional regime. The notional cap still applies on top of the reduced quantity.
 
     Returns:
         A pair containing selected candidates and skipped candidates with skip reasons.
@@ -407,13 +713,28 @@ def select_open_candidates(
         for position in positions
         if isinstance(position, Mapping)
     }
+    per_side = side_counts(positions)
 
     realized_pnl = 0.0
     if isinstance(paper_state, Mapping):
         realized_pnl = _finite_number(paper_state.get("cumulative_closed_pnl", 0.0)) or 0.0
 
     state_positions = list(positions)
-    for symbol, side in _desired_candidates(desired):
+    candidates = _desired_candidates(desired)
+    combined_regime = (regime or "").strip().lower()
+    if combined_regime in {"bullish", "bearish"}:
+        aligned_candidates: list[tuple[str, str]] = []
+        counter_candidates: list[tuple[str, str]] = []
+        for symbol, side in candidates:
+            target = (
+                aligned_candidates
+                if regime_alignment(side, combined_regime) == "aligned"
+                else counter_candidates
+            )
+            target.append((symbol, side))
+        candidates = aligned_candidates + counter_candidates
+
+    for symbol, side in candidates:
         if (symbol, side) in occupied_sides:
             skipped.append({"symbol": symbol, "side": side, "reason": "already_open_same_side"})
             continue
@@ -427,15 +748,29 @@ def select_open_candidates(
             skipped.append({"symbol": symbol, "side": side, "reason": "position_limit_reached"})
             continue
 
+        if max_positions_per_side is not None and per_side.get(side, 0) >= max_positions_per_side:
+            skipped.append({"symbol": symbol, "side": side, "reason": "side_limit_reached"})
+            continue
+
+        alignment = regime_alignment(side, combined_regime)
+        multiplier = 1.0
+        if alignment == "counter":
+            multiplier = _finite_number(regime_size_reduction) or 1.0
+            if multiplier <= 0:
+                multiplier = 1.0
+
         sizing_state = {
             "cumulative_closed_pnl": realized_pnl,
             "positions": state_positions,
         }
         current_free_balance = free_balance(config, sizing_state)
         cap = position_notional_cap(config, current_free_balance)
-        quantity, sizing_reason = size_position_qty(base_qty, price, cap)
+        quantity, sizing_reason = size_position_qty(base_qty * multiplier, price, cap)
         if sizing_reason is not None:
-            skipped.append({"symbol": symbol, "side": side, "reason": sizing_reason})
+            reason = sizing_reason
+            if alignment == "counter" and multiplier < 1.0:
+                reason = "regime_reduced_size_below_minimum"
+            skipped.append({"symbol": symbol, "side": side, "reason": reason})
             continue
 
         notional = quantity * price
@@ -447,9 +782,14 @@ def select_open_candidates(
                 "qty": quantity,
                 "notional": notional,
                 "sizing_cap": cap,
+                "size_multiplier": multiplier,
+                "regime_alignment": alignment,
+                "regime_combined": combined_regime or None,
             }
         )
         occupied_sides.add((symbol, side))
+        if side in per_side:
+            per_side[side] += 1
         state_positions.append({"symbol": symbol, "side": side, "entry": price, "qty": quantity})
 
     return selected, skipped

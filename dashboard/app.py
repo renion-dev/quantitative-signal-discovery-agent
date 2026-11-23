@@ -348,9 +348,13 @@ except ImportError:  # pragma: no cover - Linux is the supported runtime
 
 from signal_discovery_workflow.paper_trading import (
     PaperConfigError,
+    classify_consensus_regime,
+    classify_sma_regime,
+    combine_regimes,
     load_paper_config,
     resolve_paper_config_path,
     select_open_candidates,
+    side_counts,
 )
 
 PAPER_FILE=Path(__file__).parent/"paper.json"
@@ -452,6 +456,61 @@ def _paper_limits(config):
         "starting_balance":config.starting_balance,
         "max_position_size_pct":config.max_position_size_pct,
         "max_position_size_amount":config.max_position_size_amount,
+        "max_positions_per_side":config.max_positions_per_side,
+        "market_regime_filter":config.market_regime_filter,
+        "regime_size_reduction":config.regime_size_reduction,
+        "regime_symbol":config.regime_symbol,
+        "regime_fast_sma":config.regime_fast_sma,
+        "regime_slow_sma":config.regime_slow_sma,
+    }
+
+def _regime_closes(symbol,limit):
+    """Fetch daily close prices for the regime proxy instrument from Binance futures."""
+
+    url=(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1d&limit={limit}")
+    with _urllib.urlopen(url,timeout=10) as r:
+        rows=_json.loads(r.read())
+    closes=[]
+    for row in rows or []:
+        if isinstance(row,(list,tuple)) and len(row)>4:
+            closes.append(float(row[4]))
+    return closes
+
+def _market_regime(config,summary):
+    """Classify the market regime from the independent proxy and the signal consensus.
+
+    The proxy regime uses two simple moving averages of the daily closes. The consensus regime
+    uses the balance and strength of the buy and sell candidates. Only agreement between the two
+    produces a directional regime. A failed lookup degrades to an unknown proxy regime, which
+    keeps the combined regime neutral and never blocks trading.
+    """
+
+    consensus=classify_consensus_regime(summary)
+    btc={"regime":"unknown","fast_sma":None,"slow_sma":None,"samples":0}
+    limit=min(1000,max(config.regime_slow_sma*2,config.regime_slow_sma+10))
+    try:
+        closes=_regime_closes(config.regime_symbol,limit)
+        btc=classify_sma_regime(closes,config.regime_fast_sma,config.regime_slow_sma)
+    except Exception as exc:
+        logger.warning("Market-regime lookup failed for %s: %s",config.regime_symbol,exc)
+    combined=combine_regimes(btc.get("regime"),consensus.get("regime"))
+    return {
+        "enabled":True,
+        "btc":btc.get("regime"),
+        "consensus":consensus.get("regime"),
+        "combined":combined["combined"],
+        "fast_sma":btc.get("fast_sma"),
+        "slow_sma":btc.get("slow_sma"),
+        "buy_count":consensus.get("buy_count"),
+        "sell_count":consensus.get("sell_count"),
+    }
+
+def _regime_disabled():
+    """Return the regime payload used when the market-regime filter is switched off."""
+
+    return {
+        "enabled":False,"btc":"unknown","consensus":"neutral","combined":"neutral",
+        "fast_sma":None,"slow_sma":None,"buy_count":None,"sell_count":None,
     }
 
 @app.get("/api/paper/status")
@@ -518,6 +577,8 @@ def paper_status():
         if len(hist)>200: del hist[:-200]
         _save_paper(d)
     response=dict(d)
+    response["side_counts"]=side_counts(d.get("positions") or [])
+    response["regime"]=d.get("last_regime")
     if config is not None:
         response["limits"]=_paper_limits(config)
     else:
@@ -546,6 +607,11 @@ def paper_open():
         desired[r["symbol"]]="long"
     for r in s["top_sell"]:
         desired[r["symbol"]]="short"
+    regime_info=(_market_regime(config,s) if config.market_regime_filter else _regime_disabled())
+    logger.info(
+        "Paper open: config=%s regime_filter=%s regime=%s side_cap=%s",
+        config.path,config.market_regime_filter,regime_info["combined"],config.max_positions_per_side,
+    )
     with _paper_transaction():
         paper=_load_paper()
         if not desired:
@@ -553,9 +619,13 @@ def paper_open():
                 "opened":0,"closed":0,"positions":paper["positions"],
                 "note":"no desired signals, positions kept",
                 "limits":_paper_limits(config),"skipped":[],
+                "regime":regime_info,"side_counts":side_counts(paper["positions"]),
             })
         selected,skipped=select_open_candidates(
             desired,paper["positions"],prices,config,paper_state=paper,base_qty=1.0,
+            regime=regime_info["combined"] if config.market_regime_filter else None,
+            regime_size_reduction=config.regime_size_reduction,
+            max_positions_per_side=config.max_positions_per_side,
         )
         # open new only (hold existing until SL/TP)
         opened=[]
@@ -569,13 +639,16 @@ def paper_open():
                 "sl":round(px-sl_dist,6) if side=="long" else round(px+sl_dist,6),
                 "tp":round(px+tp_dist,6) if side=="long" else round(px-tp_dist,6),
                 "atr":atr,"notional":qty*px,"sizing_cap":candidate["sizing_cap"],
+                "regime_combined":candidate.get("regime_combined"),
+                "size_multiplier":candidate.get("size_multiplier",1.0),
             }
             paper["positions"].append(pos); opened.append(pos)
-        if opened:
-            _save_paper(paper)
+        paper["last_regime"]=regime_info
+        _save_paper(paper)
     return JSONResponse({
         "opened":len(opened),"closed":0,"positions":paper["positions"],
         "limits":_paper_limits(config),"skipped":skipped,
+        "regime":regime_info,"side_counts":side_counts(paper["positions"]),
     })
 
 @app.post("/api/paper/close")

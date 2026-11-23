@@ -15,5 +15,31 @@ starting_balance: 10000
 # (lower) limit applies. Leave null to disable that limit.
 #   max_position_size_pct:    percent of the free balance (e.g. 25)
 #   max_position_size_amount: fixed nominal amount in USDT (e.g. 1000)
-max_position_size_pct: null
+max_position_size_pct: 25
 max_position_size_amount: null
+
+# Maximum number of simultaneously open positions in ONE direction (long or
+# short). This is a concentration control and always applies, independently of
+# the market regime. null disables the per-side cap.
+max_positions_per_side: 2
+
+# Consider the market regime when deciding direction and size.
+#
+# The regime combines two independent sources and is directional only when
+# they agree:
+#   * proxy    - daily candles of regime_symbol, fast SMA vs slow SMA
+#                 (bull / bear / sideways)
+#   * consensus- balance and strength of the buy/sell candidates
+#                 (bull / bear / neutral)
+# Both bull -> bullish, both bear -> bearish, otherwise neutral.
+market_regime_filter: true
+
+# Size multiplier applied to a signal that goes AGAINST a non-neutral market
+# regime (0.5 = half size). 1.0 disables the reduction.
+regime_size_reduction: 0.5
+
+# Instrument used as the market-regime proxy.
+regime_symbol: BTCUSDT
+# SMA windows (in daily candles) used to classify the regime.
+regime_fast_sma: 20
+regime_slow_sma: 60

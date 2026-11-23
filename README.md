@@ -500,6 +500,140 @@ curl -s http://127.0.0.1:8090/api/metrics/summary
 
 `GET /api/evolution` returns run summaries, lineage trees, and aggregate evolution statistics. `GET /api/evolution/{run_id}` adds the saved formulas, generated code, and optimization feedback for one run. `GET /api/metrics/summary` returns metric availability, minima, maxima, and overfit flags. The EVOLUTION tab shows `SKEPTIC · N rejected · M approved` per node and one reason line per rejected candidate. These three endpoints parse saved JSON only; they do not execute the saved signal code.
 
+### Paper-Trading Limits
+
+The dashboard paper account is configured by [`configs/paper-trading.yml`](configs/paper-trading.yml). This file is optional: when it is missing, the dashboard uses the defaults below and logs one warning for that missing path. Set `PAPER_TRADING_CONFIG` before starting the dashboard to use a different file. Relative override paths are anchored to the repository root, not to the process working directory.
+
+The `Default` column below contains the built-in fallback used when the file or an individual key is absent. The shipped `configs/paper-trading.yml` overrides the percentage notional cap to `25`, sets the per-side cap to `2`, and enables the market-regime filter.
+
+| Key | Meaning | Unit | Default |
+|-----|---------|------|---------|
+| `max_open_positions` | Hard cap on simultaneously open positions; `0` prevents new positions | Positions | `3` |
+| `starting_balance` | Starting capital used by the paper-account model | USDT | `10000` |
+| `max_position_size_pct` | Per-position notional cap as a percentage of free balance; `null` disables it | Percent | `null` |
+| `max_position_size_amount` | Per-position fixed notional cap; `null` disables it | USDT | `null` |
+| `max_positions_per_side` | Maximum open positions in one direction; `0` forbids both directions and `null` disables the cap | Positions per side | `null` |
+| `market_regime_filter` | Whether the market regime affects candidate order and size | Boolean | `false` |
+| `regime_size_reduction` | Size multiplier for a signal against a directional regime | Multiplier | `0.5` |
+| `regime_symbol` | Instrument used as the regime proxy | Binance symbol | `BTCUSDT` |
+| `regime_fast_sma` / `regime_slow_sma` | Fast and slow SMA windows for the regime proxy | Daily candles | `20` / `60` |
+
+`max_open_positions` must be a non-negative integer. `starting_balance` and either notional limit, when set, must be a finite number greater than zero. `max_positions_per_side` must be `null` or a non-negative integer. `market_regime_filter` must be a boolean. `regime_size_reduction` must be a finite number in the interval `(0, 1]`. `regime_symbol` must be a non-empty string. Both SMA windows must be positive integers, and `regime_fast_sma` must be smaller than `regime_slow_sma`. Unknown keys are ignored with a warning. When both notional limits are set, the stricter (lower) cap applies.
+
+The account model is:
+
+`free_balance = starting_balance + realized_pnl - Σ |qty × entry|`
+
+Here, `realized_pnl` is the cumulative PnL of closed trades, and the sum covers the currently open positions. The percentage limit is relative to this free balance and is recomputed before each candidate is sized. An opened position is included in the next candidate's open notional, so opening one position reduces the percentage allowance available to the next.
+
+The effective notional cap is an upper bound; it never increases the dashboard's legacy one-unit position size and can only reduce it. The quantity is rounded down to eight decimal places, with an additional floating-point boundary adjustment, so the realized `qty × price` notional cannot exceed the cap. A cap below the price of one unit can produce a fractional quantity rather than rejecting the trade. If the permitted quantity rounds to zero, the candidate is skipped.
+
+The hard cap counts the currently open positions plus positions selected earlier in the same request. A symbol already open on the opposite side is a separate position and consumes a slot. A symbol already open on the same side is skipped without consuming a slot. A missing price or a rejected size also does not consume a slot.
+
+The per-side cap counts the currently open positions on that side plus positions selected earlier in the same request. It is a concentration control and always applies independently of the market regime. A value of `0` prevents new positions in either direction; `null` disables this cap.
+
+#### Market-regime classification
+
+When `market_regime_filter` is `false`, the dashboard performs no regime lookup. When it is `true`, the combined regime is derived from two independent sources:
+
+- **Proxy:** The dashboard fetches daily close candles for `regime_symbol` from Binance USDT-M futures and computes simple moving averages over the configured fast and slow windows. If the relative distance `|fast − slow| / slow` is at most `REGIME_SIDEWAYS_EPSILON` (`0.002`), the proxy is `sideways`. Otherwise, a fast average above the slow average is `bull`, and a fast average below it is `bear`. The proxy is `unknown` when fewer than `regime_slow_sma` samples are available, a close is not finite, or the slow average is not positive.
+- **Consensus:** The dashboard compares the strength of the buy and sell candidates. Buy strength is the sum of the positive `net` votes in `top_buy`; sell strength is the sum of the absolute negative `net` votes in `top_sell`. The larger strength wins. An exact strength tie is broken by the candidate counts, with more candidates winning; a remaining tie is neutral. An empty or malformed summary is neutral.
+
+Only agreement between the sources produces a directional combined regime: `bull` plus `bull` becomes `bullish`, and `bear` plus `bear` becomes `bearish`. Every other result is `neutral`, including source disagreement, a neutral consensus, or a sideways or unknown proxy.
+
+#### Regime-aware sizing and candidate priority
+
+In a `bullish` regime, a long signal is aligned with the regime and a short signal is counter-regime. In a `bearish` regime, a short signal is aligned and a long signal is counter-regime.
+
+An aligned signal opens at normal size. A counter-regime signal opens at `regime_size_reduction` times the normal size, which is half size with the default `0.5`; a value of `1.0` disables the reduction. The regime does not block a counter-regime candidate; it only reduces its size. The other position, price, and sizing controls can still skip it.
+
+Under a directional regime, aligned candidates are evaluated before counter-regime candidates, so an aligned candidate receives a scarce slot first. The original candidate order is preserved within each priority group; the dashboard builds that order with buys before sells. In a neutral regime there is no size reduction and no reordering, but the per-side cap still applies.
+
+The notional cap still applies to the reduced quantity. The quantity is then rounded down to eight decimal places, with the floating-point boundary adjustment described above, so the realized `qty × price` notional cannot exceed the cap.
+
+#### Degraded regime lookup
+
+The Binance regime request uses a 10-second socket timeout. A failed or timed-out lookup is logged as a warning, leaves the proxy `unknown` and the combined regime `neutral`, and does not skip trades. The per-side cap and all other existing limits continue to apply.
+
+| Skip reason | Meaning |
+|-------------|---------|
+| `already_open_same_side` | The same symbol and side are already open. |
+| `price_unavailable` | No finite price greater than zero is available for the symbol. |
+| `position_limit_reached` | The open count plus already selected candidates reached `max_open_positions`. |
+| `side_limit_reached` | The open count on the candidate's side plus already selected candidates reached `max_positions_per_side`. |
+| `position_notional_below_minimum` | The effective cap is non-positive or the permitted quantity rounds to zero. |
+| `regime_reduced_size_below_minimum` | The reduced counter-regime quantity cannot produce a positive position under the effective cap. |
+
+A successful `POST /api/paper/open` response has the following shape:
+
+| Endpoint | Field | Meaning |
+|----------|-------|---------|
+| `POST /api/paper/open` | `opened` | Integer count of positions opened by the request. |
+| `POST /api/paper/open` | `closed` | Integer, always `0`; opening does not close positions. |
+| `POST /api/paper/open` | `positions` | List of currently open positions. |
+| `POST /api/paper/open` | `limits` | The effective limit configuration. |
+| `POST /api/paper/open` | `skipped` | List of skipped candidates, each with `{symbol, side, reason}`. |
+| `POST /api/paper/open` | `note` | Optional explanatory field when there are no desired signals and existing positions are kept. |
+| `POST /api/paper/open` | `regime` | Market-regime result for this open request. |
+| `POST /api/paper/open` | `side_counts` | Current open-position counts as `{"long": n, "short": n}`. |
+| `GET /api/paper/status` | `positions` | List of currently open positions. |
+| `GET /api/paper/status` | `closed` | Persisted list of closed positions, when present in the account state. |
+| `GET /api/paper/status` | `limits` | The effective limit configuration, or `null` when the configuration is invalid. |
+| `GET /api/paper/status` | `regime` | Regime persisted by the most recent open, or `null` before an open has been persisted. |
+| `GET /api/paper/status` | `side_counts` | Current open-position counts as `{"long": n, "short": n}`. |
+
+The `limits` object exposes all keys in the defaults table. The `regime` object contains the following fields:
+
+| Field | Meaning |
+|-------|---------|
+| `enabled` | Whether the market-regime filter was enabled for the open request. |
+| `btc` | Proxy classification: `bull`, `bear`, `sideways`, or `unknown`. |
+| `consensus` | Consensus classification: `bull`, `bear`, or `neutral`. |
+| `combined` | Combined classification: `bullish`, `bearish`, or `neutral`. |
+| `fast_sma` | Computed fast-window average close price, or `null` when unavailable. |
+| `slow_sma` | Computed slow-window average close price, or `null` when unavailable. |
+| `buy_count` | Number of buy candidates used by the consensus classification. |
+| `sell_count` | Number of sell candidates used by the consensus classification. |
+
+The `regime.fast_sma` and `regime.slow_sma` values are computed average prices, not the window lengths. The window lengths are exposed separately as `limits.regime_fast_sma` and `limits.regime_slow_sma`. When the filter is disabled, the regime payload reports `enabled: false`, an unknown proxy, a neutral consensus and combined regime, null SMA values, and null candidate counts.
+
+`GET /api/paper/status` reports the regime persisted by the most recent open instead of performing a fresh market lookup on every poll. The status endpoint does not add `opened` or `skipped` fields. Newly opened positions include the audit fields `notional` (actual USDT notional), `sizing_cap` (the effective USDT cap used, or `null` when neither notional limit is set), `regime_combined` (the combined regime used for the position, or `null` when the filter is disabled), and `size_multiplier` (`1.0` at normal size or the configured reduction for a counter-regime position).
+
+The dashboard's CONSENSUS tab displays the open-position count and cap, starting balance, configured per-position limits, current long and short counts with the per-side cap, the combined, proxy, and consensus regimes, configuration errors, open positions, and skipped candidates from the most recent PAPER OPEN action. It does not currently display the `notional`, `sizing_cap`, `regime_combined`, or `size_multiplier` audit fields, the SMA values, or the consensus candidate counts.
+
+An invalid value in any setting above is rejected by `POST /api/paper/open` before any trading work begins. The response is HTTP 400 with this shape:
+
+```json
+{
+  "error": "<validation message>",
+  "config_error": true
+}
+```
+
+`GET /api/paper/status` remains readable when the configuration is invalid: it returns the account state with `limits` set to `null`, plus `config_error: true` and the validation message in `error`. A missing file is not an error; it falls back to the defaults above.
+
+The paper state is written atomically through a same-directory temporary file and atomic replacement. The open transaction, including candidate selection and persistence, is serialized with an advisory lock as well as an in-process lock. Concurrent requests therefore cannot exceed the hard or per-side position caps.
+
+For example, this creates an alternative configuration with two positions in total, at most one position per direction, a 10% free-balance limit, and half-size counter-regime trades, then points the dashboard at it:
+
+```bash
+cat > configs/paper-trading-custom.yml <<'YAML'
+max_open_positions: 2
+starting_balance: 10000
+max_position_size_pct: 10
+max_position_size_amount: null
+max_positions_per_side: 1
+market_regime_filter: true
+regime_size_reduction: 0.5
+regime_symbol: BTCUSDT
+regime_fast_sma: 20
+regime_slow_sma: 60
+YAML
+
+export PAPER_TRADING_CONFIG=configs/paper-trading-custom.yml
+.venv/bin/python -m uvicorn dashboard.app:app --host 0.0.0.0 --port 8090
+```
+
 ## Limitations and Caveats
 
 - **Sandbox boundary:** the in-process sandbox is AST validation plus restricted execution, not a security boundary. Subprocess mode adds resource limits and is stronger, but it is still not an operating-system container. Use container isolation for hostile code.
