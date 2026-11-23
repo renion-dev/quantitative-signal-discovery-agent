@@ -68,10 +68,32 @@ device path versus ``num_periods = 25`` on the CPU path, with a different
 ``mean_ic``. This masking difference is intentional and documented here, not
 "fixed". NaN-only inputs behave identically on both paths.
 
-Verification note: the device code path was verified through the NumPy adapter
-of the shared engine — the exact code the CuPy/PyTorch wrappers execute —
-because no NVIDIA GPU was available in the verification environment; the real
-CUDA execution path was NOT exercised.
+Verification on real hardware
+-----------------------------
+
+The device path was first verified through the NumPy adapter of the shared
+engine and has since been exercised on real CUDA hardware (NVIDIA GeForce
+RTX 2050, CUDA 12.9, ``cupy-cuda12x[ctk]`` 14.2.0) against the repository's
+S&P 500 grid (3519 dates x 381 tickers, NaN-only inputs):
+
+* numerical agreement with the CPU reference — ``|GPU mean_ic - CPU mean_ic|``
+  = 8.7e-19 (relative 2.2e-16); ``ic_std``, ``ic_ir``, ``t_stat``, ``p_value``,
+  ``num_periods`` and ``positive_ic_ratio`` agree to the same precision;
+* speed — one signal over the full grid: 0.21 s on the GPU versus 3.21 s on
+  the CPU (~15x); eight full-grid signals: 0.64 s on the GPU versus 32.0 s on
+  the CPU (~50x);
+* :func:`compute_rank_ic_batch` returns results identical to the per-signal
+  calls, but it is **not** systematically faster: it pads every signal to the
+  full returns grid (missing cells become masked NaN), while a per-signal call
+  only processes the intersection of dates/tickers. On eight signals that
+  already covered the whole grid the batch call measured 0.89x of the
+  per-signal loop, so treat it as a convenience API, not a speed-up.
+
+CuPy needs the CUDA toolkit headers to compile its runtime kernels; install
+the matching extra (``cupy-cuda12x[ctk]``) or point ``CUDA_PATH`` at a local
+toolkit. Without them the device calls raise at kernel-compile time and the
+module falls back to the CPU implementation (with a warning) — the results
+stay correct, only the acceleration is lost.
 """
 
 import logging

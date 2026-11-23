@@ -262,13 +262,13 @@ uv sync --locked --extra test
 uv run --locked pytest tests/
 ```
 
-The repo also ships a GitHub Actions workflow (`.github/workflows/ci.yml`) that runs `ruff` lint and the test suite on every pull request to `main`.
+The repo also ships a GitHub Actions workflow (`.github/workflows/ci.yml`) with three jobs on every pull request to `main`: `lint` (`ruff check src tests scripts`), `test` (pytest on Python 3.12), and `verify` (six hermetic verification scripts, each run as its own step). The scripts in `scripts/` are offline and hermetic: they require no network access or credentials, do not depend on local data artifacts or `dashboard/paper.json`, and import no dashboard runtime dependency. `scripts/verify_dashboard_static.py` statically analyzes `dashboard/index.html` for HTML sinks and template interpolation sites and fails closed.
 
 ## Project Structure
 
 ```
 quantitative-signal-discovery-agent/
-├── .github/workflows/ci.yml             # PR-level CI: ruff lint + pytest
+├── .github/workflows/ci.yml             # PR-level CI: ruff lint + pytest + hermetic verification
 ├── brev/
 │   └── launchable-setup.ipynb           # One-shot environment setup for Brev launchables
 ├── configs/
@@ -278,6 +278,13 @@ quantitative-signal-discovery-agent/
 │   ├── signal-discovery-workflow.ipynb  # Interactive walkthrough
 │   └── images/workflow-architecture.png
 ├── pyproject.toml                       # Dependencies, ruff/pytest config, NAT entry point
+├── scripts/                             # Offline/hermetic verification scripts
+│   ├── verify_sandbox.py                # Sandbox verification
+│   ├── verify_quant_metrics.py          # Quantitative metric verification
+│   ├── verify_operator_cache.py         # Operator cache verification
+│   ├── verify_skeptic_gate.py           # Skeptic gate verification
+│   ├── verify_dashboard_static.py       # Fail-closed static dashboard analysis
+│   └── verify_data_sources.py           # Data-source verification
 ├── uv.lock                              # Pinned dependency resolution
 ├── README.md
 ├── src/signal_discovery_workflow/
@@ -306,15 +313,61 @@ The workflow now includes optional performance, safety, research, and observabil
 | Multi-asset data | Registers S&P 500, Nasdaq-100, sector ETFs, major forex, spot crypto, Binance perpetual futures, fundamentals, and sentiment presets. The generic downloader writes evaluator-compatible field CSVs plus a manifest. |
 | Portfolio analytics | Builds a date-by-stock, equal-weight long/short portfolio from each signal and adds Sharpe, Sortino, drawdown, CAGR, volatility, and turnover metrics to the evaluation result. |
 | Out-of-sample validation | Splits aligned dates chronologically into in-sample and out-of-sample sets, reports both IC results, and can prevent acceptance when the result is classified as overfit. |
+| Sign-aware directional IC | Computes the direct and inverse rank IC, splits aligned dates chronologically, decides the orientation on the in-sample split only, and applies that already-fixed sign to the out-of-sample split. Because `rho(-x, y) == -rho(x, y)` exactly, the inverse mean IC is the negated direct mean IC and the absolute IC is unchanged. The feature catches a statistically significant signal oriented the wrong way and asks the advisor to invert it; it requests no inversion when the in-sample `|IC|` or p-value does not meet the configured thresholds. Insufficient in-sample or out-of-sample data is reported through dedicated `decision_reason` and `oos_reason` fields. |
 | Parallel generation | Issues one hypothesis-generation LLM call per requested signal, bounded by a concurrency semaphore, and combines the results in request order. |
 | Genetic crossover | Selects high-`|IC|` evaluated parents, asks the signal LLM for one combined hypothesis, and carries that candidate into the next iteration. |
+| Crossover fallback | When the current iteration yields fewer than two eligible parents, lets crossover draw from earlier iterations of the same run only, never across runs, and logs the number of parents and the source iterations. If fewer than two eligible parents exist across the whole run, it skips gracefully with an explicit warning. |
 | Skeptic gate | Reviews candidates before backtesting. Deterministic lookahead, leakage, degenerate-logic, and unknown-operator findings can veto a candidate; an optional LLM can also issue a `reject` verdict. Case-insensitive operator matching yields an advisory `operator_case:` for case-only mismatches, while genuinely unknown operators still veto. |
 | Evolution tracking | Assigns a run ID and records the request, iteration, parent signal, and lineage source in every saved iteration so the dashboard can build a run tree. |
 | Sandboxed execution | Optionally validates generated Python with AST rules and executes it in a restricted namespace. A subprocess API with CPU, memory, and wall-clock limits is also available. |
-| GPU Rank IC | Optionally delegates rank-IC computation to CuPy or PyTorch, with automatic CPU fallback when no usable accelerator is present. |
+| GPU Rank IC | Optionally delegates rank-IC computation to CuPy or PyTorch, with automatic CPU fallback when no usable accelerator is present. On the repository's real S&P 500 grid, the verified CuPy path matched CPU mean IC within `8.7e-19` and measured about `15x` faster for one full-grid signal and about `50x` faster for eight; see [Measured Performance](#measured-performance). |
 | Operator memoization | Optionally reuses identical operator results across candidate modules with content- and implementation-aware cache keys. |
 
 Measured with the production `extract_json_array` extraction path over the 9,374 saved artifacts (18,665 candidate occurrences with a formula), the reconstructed pre-change gate blocked 1,223 candidates (6.55%); the current gate blocks 930 (4.98%), recovering 293. The change reclassified 334 case-only operator findings (across 321 candidate occurrences) from blocking to advisory — 28 of those candidates stay blocked for another reason — while all 956 genuine unknown-operator findings (across 928 candidate occurrences) remain blocking, with none lost. The rate is per candidate occurrence across repeated optimization runs, not per distinct signal concept: deduplicating by name (3,250 distinct names) would conflate 245 names that received different verdicts in different iterations. Case mismatches resolve to the candidate's self-contained helper (correct result) or raise an explicit backtest-time `NameError`; they cannot silently produce a wrong metric.
+
+## Measured Performance
+
+### GPU Rank IC on the S&P 500 Grid
+
+The real CUDA path was exercised on an NVIDIA GeForce RTX 2050 with CUDA 12.9 and CuPy 14.2.0 (`cupy-cuda12x[ctk]`). CuPy needs the CUDA toolkit headers to compile its runtime kernels: install the matching extra (`cupy-cuda12x[ctk]`) or point `CUDA_PATH` at a local toolkit. Without the headers, the device calls raise at kernel-compile time and the module falls back to CPU with a warning; results stay correct, but the acceleration is lost.
+
+On the repository's real S&P 500 grid (3,519 dates × 381 tickers, NaN-only inputs), `backend="cupy"` produced `|GPU mean_ic - CPU mean_ic| = 8.7e-19` (relative `2.2e-16`). The `ic_std`, `ic_ir`, `t_stat`, `p_value`, `num_periods`, and `positive_ic_ratio` metrics agreed to the same precision.
+
+| Workload | GPU | CPU | Speedup |
+|----------|-----|-----|---------|
+| One signal over the full grid | 0.21 s | 3.21 s | ~15x |
+| Eight full-grid signals | 0.64 s | 32.0 s | ~50x |
+
+In this verification, `compute_rank_ic_batch` returned results identical to the per-signal calls, but it is not systematically faster. It pads every signal to the full returns grid (missing cells become masked NaN), while a per-signal call processes only the intersection of dates and tickers. For eight signals that already covered the whole grid, the batch call measured 0.89x of the per-signal loop, so treat it as a convenience API, not a speed-up. The device path masks `±inf`; the CPU path retains `±inf` through `dropna()` semantics.
+
+### A/B Benchmark: Full Optional Bundle (N=5 per arm)
+
+This benchmark executed five control runs and five treatment runs against live NVIDIA NIM using `nvidia/nemotron-3.5-lightning-30b-a3b`. Both arms used the identical request (`momentum signals`), the same model, and the same thresholds (`ic_threshold: 0.02`, `p_value_threshold: 0.05`); only the optional switches differed. GPU acceleration was off in both arms and was not a variable.
+
+The control arm turned off the benchmarked optional capabilities: parallel generation, genetic crossover, skeptic review, OOS validation, directional IC, crossover fallback, and operator cache. The treatment arm turned on all of them.
+
+All 10 runs exited with status 0 and produced evaluable signals. All 10 ended as `best_effort`: the best `|IC|` never reached the 0.02 acceptance threshold, although every run passed the p-value gate. The workflow ranks candidates by `|IC|` and does not invert the signal sign, so a statistically significant negative IC still counts as a strong candidate under that ranking.
+
+**Efficiency.** Treatment was slower in every paired repetition. Control runtimes ranged from 31.5 to 48.1 s (mean 39.3 s), and treatment runtimes ranged from 77.3 to 109.4 s (mean 89.2 s); even the slowest treatment run was slower than the fastest control run. The mean paired difference was **+49.9 s (+127%)** (paired t = 9.82, p = 0.0006, Cohen's dz = 4.39); an unpaired Welch check gives p = 0.00025. The minimum detectable difference at 80% power is about 19–21 s, so the observed slowdown is much larger than the measured noise.
+
+**Signal quality.** Treatment's best `|IC|` was on average about 10% lower. However, the paired 95% CI was [-0.0046, +0.0020] and includes zero, and the observed difference (0.0013) is below the approximately 0.0045 difference detectable at 80% power. The quality result is therefore statistically indistinguishable at N=5; it is not evidence of degradation.
+
+**Directional IC.** All 10 treatment iteration artifacts contained a `directional_ic` payload. The in-sample orientation was negative in 10/10 (in-sample IC between -0.008 and -0.014, in-sample p < 0.05), but the magnitude never met the configured 0.02 significance threshold. The feature therefore correctly requested no inversion, and no directional-IC advisor advice was emitted. Control artifacts contained no `directional_ic` payload at all; the legacy key set is unchanged when the flag is off.
+
+**Crossover and skeptic activity.** The treatment runs produced nine crossover candidates, of which only four of nine reached a subsequent evaluated iteration. Four candidates were produced after the final iteration, and one crossover response was unparseable and skipped. The new fallback branch was never exercised: no run had fewer than two eligible parents. One skeptic veto occurred in one of the five treatment runs.
+
+**Convergence.** Control converged to one identical formula (`Div(TS_Return(Close, 10), Decay_Linear(Volume, 10))`) in 2 of 5 runs, with identical mean IC to all printed digits. Treatment produced five distinct selected formulas in 5 of 5 runs. The benchmark therefore partly measures where the model converges, not 10 independent quality draws.
+
+#### Benchmark Limitations
+
+- N=5 per arm provides low statistical power.
+- The two arms ran sequentially rather than randomized/interleaved, so arm is confounded with time and possible live-API drift.
+- The treatment changes six capabilities at once, so no individual feature can be attributed.
+- The directional-IC inversion path and crossover fallback path were not productively exercised in this benchmark.
+
+#### Conclusion
+
+On this evidence, the full optional bundle roughly doubles latency without a demonstrated quality or acceptance benefit, so it should **not** be enabled by default. The features remain off by default and independently configurable. Enable the features individually and run a larger, randomized, factorial/ablation benchmark before adopting the bundle.
 
 ## Advanced Configuration
 
@@ -328,8 +381,10 @@ The following values are present in both [`configs/config-optimization.yml`](con
 | `max_concurrency` | `4` | Maximum simultaneous hypothesis LLM calls when `parallel_generation` is enabled. |
 | `genetic_crossover` | `false` | Create one crossover candidate from the two best evaluated parents and carry it into the next iteration. |
 | `genetic_parents` | `2` | Number of top-`|IC|` parents considered; the first two are combined and any additional parents are supplied as context. |
+| `crossover_fallback_enabled` | `false` | Allow crossover to draw eligible parents from earlier iterations of the same run when the current iteration has fewer than two. |
 | `skeptic_review` | `false` | Run the pre-backtest candidate review. |
 | `skeptic_llm` | `null` | Optional LLM block for the review; `null` runs deterministic static checks only. |
+| `directional_ic_enabled` | `false` | Compute sign-aware directional IC and request a sign inversion only for a statistically significant negative in-sample orientation. |
 | `oos_validation` | `false` | Add the chronological in-sample/out-of-sample IC check. |
 | `oos_train_ratio` | `0.7` | Fraction of aligned dates assigned to the in-sample split. |
 | `oos_reject_overfit` | `false` | Prevent a candidate classified as overfit from satisfying the acceptance gate. |
@@ -449,7 +504,7 @@ curl -s http://127.0.0.1:8090/api/metrics/summary
 
 - **Sandbox boundary:** the in-process sandbox is AST validation plus restricted execution, not a security boundary. Subprocess mode adds resource limits and is stronger, but it is still not an operating-system container. Use container isolation for hostile code.
 - **Sandbox mode:** `SIGNAL_SANDBOX_ENABLED=1` selects the evaluator's in-process restricted mode. Subprocess isolation is available only through `execute_signal_code_sandboxed(..., allow_subprocess=True)`.
-- **GPU verification:** the environment used to verify this feature set had no usable NVIDIA GPU, so `get_backend()` resolved to `"cpu"` and the real CUDA path was not exercised. CuPy and PyTorch wheels are optional, not default dependencies.
+- **GPU verification:** The real CUDA path has been executed and verified on an NVIDIA GeForce RTX 2050 with CUDA 12.9 and CuPy 14.2.0 (`cupy-cuda12x[ctk]`). CuPy needs the CUDA toolkit headers to compile its runtime kernels: install the matching extra (`cupy-cuda12x[ctk]`) or point `CUDA_PATH` at a local toolkit. Without the headers, the device calls raise at kernel-compile time and the module falls back to CPU with a warning; results stay correct, but the acceleration is lost. CuPy and PyTorch wheels remain optional, not default dependencies.
 - **Non-finite GPU inputs:** the device path masks `±inf` while the CPU path retains it through `dropna()` semantics. Device and CPU results can therefore differ for `±inf`; NaN-only inputs match.
 - **Sentiment provider:** sentiment requires an injected provider. The default fetcher makes no network request, returns empty frames, and writes no sentiment data file.
 - **Static universes:** the Nasdaq-100 preset is a static, approximately 100-name list (99 symbols in the current source), not a live constituent index. Other preset universes are also snapshots rather than continuously refreshed memberships.
