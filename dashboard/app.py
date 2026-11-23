@@ -339,8 +339,23 @@ def alert():
         return JSONResponse({"ok":res.get("ok",False)})
     except Exception as e:
         return JSONResponse({"error":str(e)})
-import os as _os
+from contextlib import contextmanager as _contextmanager
+import tempfile as _tempfile
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Linux is the supported runtime
+    _fcntl=None
+
+from signal_discovery_workflow.paper_trading import (
+    PaperConfigError,
+    load_paper_config,
+    resolve_paper_config_path,
+    select_open_candidates,
+)
+
 PAPER_FILE=Path(__file__).parent/"paper.json"
+_PAPER_THREAD_LOCK=threading.Lock()
+_PAPER_CONFIG_WARNED=set()
 
 def _atr(sym, period=14):
     try:
@@ -354,16 +369,98 @@ def _atr(sym, period=14):
 
 def _load_paper():
     if PAPER_FILE.exists():
-        try: return json.loads(PAPER_FILE.read_text())
-        except Exception: pass
+        try:
+            data=json.loads(PAPER_FILE.read_text())
+            if isinstance(data,dict):
+                if not isinstance(data.get("positions",[]),list):
+                    data["positions"]=[]
+                return data
+        except Exception:
+            pass
     return {"positions":[]}
 
-def _save_paper(d): PAPER_FILE.write_text(json.dumps(d))
+def _save_paper(d):
+    """Atomically persist paper state by replacing a same-directory temporary file."""
+
+    PAPER_FILE.parent.mkdir(parents=True,exist_ok=True)
+    fd,tmp_name=_tempfile.mkstemp(prefix=f".{PAPER_FILE.name}.",suffix=".tmp",dir=PAPER_FILE.parent)
+    try:
+        with os.fdopen(fd,"w",encoding="utf-8") as f:
+            json.dump(d,f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name,PAPER_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+@_contextmanager
+def _paper_transaction():
+    """Serialize paper-state transactions across dashboard threads and processes.
+
+    Locking the stable dashboard-directory inode avoids a separate untracked lock artifact and
+    remains valid when ``paper.json`` is atomically replaced.
+    """
+
+    with _PAPER_THREAD_LOCK:
+        if _fcntl is None:
+            yield
+            return
+        fd=os.open(str(PAPER_FILE.parent),os.O_RDONLY)
+        try:
+            _fcntl.flock(fd,_fcntl.LOCK_EX)
+            yield
+        finally:
+            _fcntl.flock(fd,_fcntl.LOCK_UN)
+            os.close(fd)
+
+def _load_paper_configuration():
+    """Load the paper config and emit deduplicated missing/unknown-key warnings."""
+
+    path=resolve_paper_config_path()
+    try:
+        config=load_paper_config(path)
+    except PaperConfigError as exc:
+        warning_key=f"invalid:{path}"
+        if warning_key not in _PAPER_CONFIG_WARNED:
+            _PAPER_CONFIG_WARNED.add(warning_key)
+            logger.error("Invalid paper-trading config: %s",exc)
+        raise
+    _PAPER_CONFIG_WARNED.discard(f"invalid:{path}")
+    if config.file_missing:
+        warning_key=f"missing:{path}"
+        if warning_key not in _PAPER_CONFIG_WARNED:
+            _PAPER_CONFIG_WARNED.add(warning_key)
+            logger.warning("Paper-trading config not found at %s; using defaults",path)
+    else:
+        _PAPER_CONFIG_WARNED.discard(f"missing:{path}")
+    for message in config.warnings:
+        warning_key=f"warning:{path}:{message}"
+        if warning_key not in _PAPER_CONFIG_WARNED:
+            _PAPER_CONFIG_WARNED.add(warning_key)
+            logger.warning("Paper-trading config warning: %s",message)
+    return config
+
+def _paper_limits(config):
+    """Return the effective configuration exposed by the paper-trading API."""
+
+    return {
+        "max_open_positions":config.max_open_positions,
+        "starting_balance":config.starting_balance,
+        "max_position_size_pct":config.max_position_size_pct,
+        "max_position_size_amount":config.max_position_size_amount,
+    }
 
 @app.get("/api/paper/status")
 def paper_status():
-    d=_load_paper()
-    # mark-to-market
+    try:
+        config=_load_paper_configuration()
+        config_error=None
+    except PaperConfigError as exc:
+        config=None; config_error=str(exc)
     prices={}
     try:
         url="https://fapi.binance.com/fapi/v1/ticker/24hr"
@@ -371,56 +468,68 @@ def paper_status():
             for t in _json.loads(r.read()):
                 prices[t["symbol"]]=float(t["lastPrice"])
     except Exception: pass
-    total=0.0
-    remaining=[]
-    for p in d["positions"]:
-        px=prices.get(p["symbol"],p["entry"])
-        atr=p.get("atr") or (abs(p["entry"]-p["sl"])/1.5)
-        # price velocity: change over last 3 bars
-        vel=0.0
-        try:
-            sd=_load_stock_data()
-            C=sd["Close"][p["symbol"]]
-            if len(C)>=4:
-                vel=abs((C.iloc[-1]-C.iloc[-4])/C.iloc[-4])
-        except Exception:
-            pass
-        # tighten trail on fast moves, widen on slow
-        mult=1.5 if vel<0.02 else 1.0
-        hit=False
-        # trailing stop: ratchet SL in favorable direction
-        if p["side"]=="long":
-            new_sl=px-atr*mult
-            if new_sl>p.get("sl",0):
-                p["sl"]=round(new_sl,6)
-            if px<=p["sl"] or px>=p["tp"]: hit=True
-            pnl=(px-p["entry"])*p["qty"]
-        else:
-            new_sl=px+atr*mult
-            if new_sl<p.get("sl",float('inf')):
-                p["sl"]=round(new_sl,6)
-            if px>=p["sl"] or px<=p["tp"]: hit=True
-            pnl=(p["entry"]-px)*p["qty"]
-        p["mark"]=px; p["pnl"]=round(pnl,4)
-        if hit:
-            p["exit"]=px; p["closed_reason"]="SL/TP"
-            d.setdefault("closed",[]).append(p)
-            d["cumulative_closed_pnl"]=round(d.get("cumulative_closed_pnl",0)+pnl,4)
-            d["last_pnl"]=round(pnl,4)
-        else:
-            remaining.append(p); total+=pnl
-    d["positions"]=remaining
-    d["total_pnl"]=round(total,4)
-    d["combined_pnl"]=round(d.get("cumulative_closed_pnl",0)+total,4)
-    hist=d.setdefault("history",[])
-    hist.append({"ts":int(time.time()),"pnl":d["total_pnl"],"n":len(remaining),
-                 "pos":{p["symbol"]:p["pnl"] for p in remaining}})
-    if len(hist)>200: del hist[:-200]
-    _save_paper(d)
-    return JSONResponse(d)
+    with _paper_transaction():
+        d=_load_paper()
+        # mark-to-market
+        total=0.0
+        remaining=[]
+        for p in d["positions"]:
+            px=prices.get(p["symbol"],p["entry"])
+            atr=p.get("atr") or (abs(p["entry"]-p["sl"])/1.5)
+            # price velocity: change over last 3 bars
+            vel=0.0
+            try:
+                sd=_load_stock_data()
+                C=sd["Close"][p["symbol"]]
+                if len(C)>=4:
+                    vel=abs((C.iloc[-1]-C.iloc[-4])/C.iloc[-4])
+            except Exception:
+                pass
+            # tighten trail on fast moves, widen on slow
+            mult=1.5 if vel<0.02 else 1.0
+            hit=False
+            # trailing stop: ratchet SL in favorable direction
+            if p["side"]=="long":
+                new_sl=px-atr*mult
+                if new_sl>p.get("sl",0):
+                    p["sl"]=round(new_sl,6)
+                if px<=p["sl"] or px>=p["tp"]: hit=True
+                pnl=(px-p["entry"])*p["qty"]
+            else:
+                new_sl=px+atr*mult
+                if new_sl<p.get("sl",float('inf')):
+                    p["sl"]=round(new_sl,6)
+                if px>=p["sl"] or px<=p["tp"]: hit=True
+                pnl=(p["entry"]-px)*p["qty"]
+            p["mark"]=px; p["pnl"]=round(pnl,4)
+            if hit:
+                p["exit"]=px; p["closed_reason"]="SL/TP"
+                d.setdefault("closed",[]).append(p)
+                d["cumulative_closed_pnl"]=round(d.get("cumulative_closed_pnl",0)+pnl,4)
+                d["last_pnl"]=round(pnl,4)
+            else:
+                remaining.append(p); total+=pnl
+        d["positions"]=remaining
+        d["total_pnl"]=round(total,4)
+        d["combined_pnl"]=round(d.get("cumulative_closed_pnl",0)+total,4)
+        hist=d.setdefault("history",[])
+        hist.append({"ts":int(time.time()),"pnl":d["total_pnl"],"n":len(remaining),
+                     "pos":{p["symbol"]:p["pnl"] for p in remaining}})
+        if len(hist)>200: del hist[:-200]
+        _save_paper(d)
+    response=dict(d)
+    if config is not None:
+        response["limits"]=_paper_limits(config)
+    else:
+        response["limits"]=None; response["config_error"]=True; response["error"]=config_error
+    return JSONResponse(response)
 
 @app.post("/api/paper/open")
 def paper_open():
+    try:
+        config=_load_paper_configuration()
+    except PaperConfigError as exc:
+        return JSONResponse({"error":str(exc),"config_error":True},status_code=400)
     d=_consensus_data()
     if d.get("error"): return JSONResponse({"error":d["error"]})
     s=d["summary"]
@@ -432,36 +541,45 @@ def paper_open():
                 prices[t["symbol"]]=float(t["lastPrice"])
     except Exception as e:
         return JSONResponse({"error":str(e)})
-    paper=_load_paper()
-    open_syms={p["symbol"]:p for p in paper["positions"]}
     desired={}
     for r in s["top_buy"]:
         desired[r["symbol"]]="long"
     for r in s["top_sell"]:
         desired[r["symbol"]]="short"
-    if not desired:
-        return JSONResponse({"opened":0,"closed":0,"positions":paper["positions"],"note":"no desired signals, positions kept"})
-    # open new only (hold existing until SL/TP)
-    opened=[]
-    for sym,side in desired.items():
-        if sym in open_syms and open_syms[sym]["side"]==side:
-            continue
-        px=prices.get(sym)
-        if px is None: continue
-        atr=_atr(sym)
-        sl_dist = (atr*1.5) if atr else px*0.02
-        tp_dist = (atr*3.0) if atr else px*0.04
-        pos={"symbol":sym,"side":side,"entry":px,"qty":1.0,
-             "sl":round(px-sl_dist,6) if side=="long" else round(px+sl_dist,6),
-             "tp":round(px+tp_dist,6) if side=="long" else round(px-tp_dist,6),
-             "atr":atr}
-        paper["positions"].append(pos); opened.append(pos)
-    _save_paper(paper)
-    return JSONResponse({"opened":len(opened),"closed":0,"positions":paper["positions"]})
+    with _paper_transaction():
+        paper=_load_paper()
+        if not desired:
+            return JSONResponse({
+                "opened":0,"closed":0,"positions":paper["positions"],
+                "note":"no desired signals, positions kept",
+                "limits":_paper_limits(config),"skipped":[],
+            })
+        selected,skipped=select_open_candidates(
+            desired,paper["positions"],prices,config,paper_state=paper,base_qty=1.0,
+        )
+        # open new only (hold existing until SL/TP)
+        opened=[]
+        for candidate in selected:
+            sym=candidate["symbol"]; side=candidate["side"]; px=candidate["price"]
+            qty=candidate["qty"]; atr=_atr(sym)
+            sl_dist = (atr*1.5) if atr else px*0.02
+            tp_dist = (atr*3.0) if atr else px*0.04
+            pos={
+                "symbol":sym,"side":side,"entry":px,"qty":qty,
+                "sl":round(px-sl_dist,6) if side=="long" else round(px+sl_dist,6),
+                "tp":round(px+tp_dist,6) if side=="long" else round(px-tp_dist,6),
+                "atr":atr,"notional":qty*px,"sizing_cap":candidate["sizing_cap"],
+            }
+            paper["positions"].append(pos); opened.append(pos)
+        if opened:
+            _save_paper(paper)
+    return JSONResponse({
+        "opened":len(opened),"closed":0,"positions":paper["positions"],
+        "limits":_paper_limits(config),"skipped":skipped,
+    })
 
 @app.post("/api/paper/close")
 def paper_close():
-    paper=_load_paper()
     prices={}
     try:
         url="https://fapi.binance.com/fapi/v1/ticker/24hr"
@@ -470,14 +588,16 @@ def paper_close():
                 prices[t["symbol"]]=float(t["lastPrice"])
     except Exception as e:
         return JSONResponse({"error":str(e)})
-    total=0.0
-    for p in paper["positions"]:
-        px=prices.get(p["symbol"],p["entry"])
-        pnl=(px-p["entry"])*p["qty"] if p["side"]=="long" else (p["entry"]-px)*p["qty"]
-        p["exit"]=px; p["pnl"]=round(pnl,4); total+=pnl
-    paper["closed"]=paper["positions"]; paper["positions"]=[]; paper["last_pnl"]=round(total,4)
-    paper["cumulative_closed_pnl"]=round(paper.get("cumulative_closed_pnl",0)+total,4)
-    _save_paper(paper)
+    with _paper_transaction():
+        paper=_load_paper()
+        total=0.0
+        for p in paper["positions"]:
+            px=prices.get(p["symbol"],p["entry"])
+            pnl=(px-p["entry"])*p["qty"] if p["side"]=="long" else (p["entry"]-px)*p["qty"]
+            p["exit"]=px; p["pnl"]=round(pnl,4); total+=pnl
+        paper["closed"]=paper["positions"]; paper["positions"]=[]; paper["last_pnl"]=round(total,4)
+        paper["cumulative_closed_pnl"]=round(paper.get("cumulative_closed_pnl",0)+total,4)
+        _save_paper(paper)
     return JSONResponse({"closed":len(paper["closed"]),"total_pnl":paper["last_pnl"]})
 @app.get("/api/paper/history")
 def paper_history():

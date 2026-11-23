@@ -242,16 +242,35 @@ async function refresh(){
   const prices=await fetch('/api/prices').then(r=>r.json()).catch(()=>({}));
   const paper=await fetch('/api/paper/status').then(r=>r.json()).catch(()=>({}));
   const pel=document.getElementById('paper');
-  if(paper.positions&&paper.positions.length){
-    pel.innerHTML=`<div class="mb-2">Total PnL: <span class="${(paper.total_pnl||0)>=0?'text-green-400':'text-red-400'} font-bold">${(paper.total_pnl||0).toFixed(4)}</span></div>`+
-      paper.positions.map(p=>`<div class="flex justify-between py-1 border-b border-gray-800/50">
-        <span>${esc(p.symbol)} <span class="${p.side==='long'?'text-green-400':'text-red-400'}">${esc(p.side)}</span></span>
-        <span>entry ${p.entry} → ${p.mark||'—'} <span class="${(p.pnl||0)>=0?'text-green-400':'text-red-400'}">${(p.pnl||0).toFixed(4)}</span></span>
-      </div>
-      <div class="text-xs text-cyan-300 pl-2 pb-2">SL ${fmtP(p.sl,p.entry)} · TP ${fmtP(p.tp,p.entry)}</div>`).join('');
-  } else {
-    pel.innerHTML=`<div class="text-gray-500">No open positions. Last PnL: ${paper.last_pnl!==undefined?paper.last_pnl:'—'}</div>`;
-  }
+  const paperPositions=Array.isArray(paper.positions)?paper.positions:[];
+  const limits=paper.limits||{};
+  const openCount=paperPositions.length;
+  const maxOpen=(limits.max_open_positions===null||limits.max_open_positions===undefined)?'—':limits.max_open_positions;
+  const starting=(limits.starting_balance===null||limits.starting_balance===undefined)?'—':limits.starting_balance;
+  const pctLimit=(limits.max_position_size_pct===null||limits.max_position_size_pct===undefined)?null:limits.max_position_size_pct;
+  const amountLimit=(limits.max_position_size_amount===null||limits.max_position_size_amount===undefined)?null:limits.max_position_size_amount;
+  const hasPct=pctLimit!==null,hasAmount=amountLimit!==null;
+  const perPosition=(hasPct||hasAmount)?(hasPct?esc(pctLimit)+'% of free balance':'')+(hasPct&&hasAmount?' · ':'')+(hasAmount?esc(amountLimit)+' USDT':''):'No per-position notional limit';
+  const lastOpen=window._paperOpenResult||{};
+  const skipped=Array.isArray(lastOpen.skipped)?lastOpen.skipped:[];
+  const configError=paper.config_error?`CONFIG ERROR: ${esc(paper.error||'invalid paper-trading config')}`:'';
+  pel.innerHTML=`<div class="mb-2 p-2 border border-gray-700 rounded">
+    <div>Open positions: <span class="font-bold text-cyan-300">${esc(openCount)}</span> / ${esc(maxOpen)}</div>
+    <div class="text-gray-400 mt-1">Starting balance: ${esc(starting)} USDT</div>
+    <div class="text-gray-400 mt-1">Max per position: ${esc(perPosition)}</div>
+    ${configError?`<div class="text-red-400 mt-1">${esc(configError)}</div>`:''}
+  </div>
+  ${paperPositions.length?`<div class="mb-2">Total PnL: <span class="${(paper.total_pnl||0)>=0?'text-green-400':'text-red-400'} font-bold">${(paper.total_pnl||0).toFixed(4)}</span></div>`:''}
+  ${paperPositions.map(p=>`<div class="flex justify-between py-1 border-b border-gray-800/50">
+    <span>${esc(p.symbol)} <span class="${p.side==='long'?'text-green-400':'text-red-400'}">${esc(p.side)}</span></span>
+    <span>entry ${esc(p.entry)} → ${esc(p.mark||'—')} <span class="${(p.pnl||0)>=0?'text-green-400':'text-red-400'}">${esc((p.pnl||0).toFixed(4))}</span></span>
+  </div>
+  <div class="text-xs text-cyan-300 pl-2 pb-2">SL ${esc(fmtP(p.sl,p.entry))} · TP ${esc(fmtP(p.tp,p.entry))}</div>`).join('')}
+  ${!paperPositions.length?`<div class="text-gray-500">No open positions. Last PnL: ${esc(paper.last_pnl!==undefined?paper.last_pnl:'—')}</div>`:''}
+  ${skipped.length?`<div class="mt-3 p-2 border border-yellow-900/60 rounded text-yellow-300">
+    <div class="tracking-widest mb-1">SKIPPED CANDIDATES</div>
+    ${skipped.map(s=>`<div>${esc(s.symbol)} · ${esc(s.side)} — ${esc(s.reason)}</div>`).join('')}
+  </div>`:''}`;
   const cel=document.getElementById('consensus');
   const cstat=document.getElementById('consensus-stats');
   if(cons.error){cel.innerHTML='<div class="text-gray-500">'+esc(cons.error)+'</div>';document.getElementById('cons_count').textContent='';}
@@ -308,8 +327,21 @@ function renderDetail(name,longs,shorts,metrics){
       </div>
     </div>`;
 }
-async function paperOpen(){const r=await fetch('/api/paper/open',{method:'POST'}).then(x=>x.json());alert(r.opened?`Opened ${r.opened} positions`: (r.error||'failed'));}
-async function paperClose(){const r=await fetch('/api/paper/close',{method:'POST'}).then(x=>x.json());alert(r.closed!==undefined?`Closed ${r.closed}, PnL ${r.total_pnl}`:(r.error||'failed'));}
+async function paperOpen(showAlert=true){
+  const r=await fetch('/api/paper/open',{method:'POST'}).then(x=>x.json());
+  window._paperOpenResult=r;
+  if(showAlert){
+    const skipped=(r.skipped||[]).map(s=>`${esc(s.symbol)} (${esc(s.side)}): ${esc(s.reason)}`).join('\n');
+    const summary=r.error?`Error: ${esc(r.error)}`:`Opened ${esc(r.opened??0)} position(s)`;
+    alert(summary+(skipped?'\nSkipped:\n'+skipped:''));
+  }
+  return r;
+}
+async function paperClose(){
+  const r=await fetch('/api/paper/close',{method:'POST'}).then(x=>x.json());
+  window._paperOpenResult={skipped:[]};
+  alert(r.closed!==undefined?`Closed ${esc(r.closed)}, PnL ${esc(r.total_pnl)}`:esc(r.error||'failed'));
+}
 async function sendAlert(){const r=await fetch('/api/alert',{method:'POST'}).then(x=>x.json());alert(r.ok?'Alert sent':(r.error||'failed'));}
 async function exportCSV(){const cons=await fetch('/api/consensus').then(r=>r.json());const prices=await fetch('/api/prices').then(r=>r.json()).catch(()=>({}));let csv='symbol,long,short,net,price,change24h\n';for(const r of cons.rows){const p=prices[r.symbol]||{};csv+=`${r.symbol},${r.long},${r.short},${r.net},${p.price||''},${p.change24h||''}\n`;}const blob=new Blob([csv],{type:'text/csv'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='consensus.csv';a.click();}
 let _portChart=null;
@@ -450,7 +482,7 @@ async function run(){
   refresh();
 }
 let _autoTimer=null;
-async function autoStart(){await fetch('/api/auto/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input:document.getElementById('inp').value})}); if(_autoTimer)clearInterval(_autoTimer); _autoTimer=setInterval(async()=>{await refresh();await fetch('/api/paper/open',{method:'POST'});},30000); refresh(); await fetch('/api/paper/open',{method:'POST'});}
+async function autoStart(){await fetch('/api/auto/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input:document.getElementById('inp').value})}); if(_autoTimer)clearInterval(_autoTimer); _autoTimer=setInterval(async()=>{await refresh();await paperOpen(false);},30000); refresh(); await paperOpen(false);}
 async function autoStop(){await fetch('/api/auto/stop',{method:'POST'}); if(_autoTimer){clearInterval(_autoTimer);_autoTimer=null;} refresh();}
 async function showCard(sym){const c=await fetch('/api/card?symbol='+sym).then(r=>r.json());const lp=await fetch('/api/price?symbol='+sym).then(r=>r.json());const el=document.getElementById('cardbox');const modal=document.getElementById('cardmodal');modal.style.display='flex';el.innerHTML=`<div class="flex justify-between items-center mb-2"><div class="text-cyan-300 font-bold">${esc(c.symbol)}</div><button onclick="document.getElementById('cardmodal').style.display='none';if(window._live)clearInterval(window._live);" class="text-xs text-gray-400 hover:text-white">✕ CLOSE</button></div><div class="mb-2 text-sm font-bold ${lp.price>c.sma20?'text-green-400':'text-red-400'}">DECISION: ${lp.price>c.sma20?'LONG':'SHORT'} (conf ${c.conf})</div><div class="grid grid-cols-2 gap-2 text-xs"><div>Price (live): <span id="liveprice" class="metric" style="font-size:14px">${lp.price}</span></div><div>24h: <span class="${c.change24>=0?'text-green-400':'text-red-400'}">${c.change24}%</span></div><div>7d: <span class="${c.trend7>=0?'text-green-400':'text-red-400'}">${c.trend7}%</span></div><div>SMA20: ${c.sma20}</div><div>20d High: ${c.high20}</div><div>20d Low: ${c.low20}</div><div>Avg Vol: ${c.avgvol}</div><div>Suggested size: <span class="text-cyan-400">${c.pos}x</span></div></div><div class="text-xs text-gray-400 mt-2">Rationale: price ${lp.price>c.sma20?'above':'below'} SMA20 → ${lp.price>c.sma20?'momentum up, enter long':'mean-reversion down, enter short'}.</div>`;if(window._live)clearInterval(window._live);window._live=setInterval(async()=>{const p=await fetch('/api/price?symbol='+sym).then(r=>r.json());const e=document.getElementById('liveprice');if(e)e.textContent=p.price;},3000);
 }
