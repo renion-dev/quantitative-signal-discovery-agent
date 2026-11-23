@@ -52,6 +52,7 @@ evaluator's operator cache.
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import traceback
@@ -522,6 +523,318 @@ def compute_rank_ic(
                 "95th": float(np.percentile(ic_array, 95)),
             },
         }
+
+
+#: Minimum usable IC dates required for the IS sign decision and,
+#: independently, for OOS reporting.  This matches the minimum sample used by
+#: :func:`quant_metrics.cross_validate_signal`.
+DIRECTIONAL_IC_MIN_PERIODS = 30
+
+
+def _finite_float(value: Any) -> float | None:
+    """Return a plain finite ``float`` for ``value``, or ``None``."""
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _plain_period_count(value: Any) -> int:
+    """Return a non-negative plain ``int`` period count."""
+    try:
+        count = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, count)
+
+
+def _directional_ic_payload() -> dict[str, Any]:
+    """Return the stable, JSON-safe no-decision directional-IC payload."""
+    return {
+        "direct_mean_ic": None,
+        "inverse_mean_ic": None,
+        "absolute_ic": None,
+        "train_mean_ic": None,
+        "train_p_value": None,
+        "train_num_periods": 0,
+        "inverse_train_mean_ic": None,
+        "test_mean_ic": None,
+        "test_p_value": None,
+        "test_num_periods": 0,
+        "inverse_test_mean_ic": None,
+        "oriented_test_mean_ic": None,
+        "oriented_test_p_value": None,
+        "detected_sign": 0,
+        "decision": "none",
+        "decision_reason": None,
+        "is_significant": False,
+        "should_invert": False,
+        "oos_reason": None,
+        "split_date": None,
+        "error": None,
+    }
+
+
+def compute_directional_ic(
+    signal_values: pd.DataFrame,
+    forward_returns: pd.DataFrame,
+    train_ratio: float = 0.7,
+    ic_threshold: float = 0.03,
+    p_value_threshold: float = 0.05,
+    min_periods: int = DIRECTIONAL_IC_MIN_PERIODS,
+) -> dict[str, Any]:
+    """Compute sign-aware directional IC with an in-sample-only sign decision.
+
+    The direct and inverse directions are evaluated by reusing
+    :func:`compute_rank_ic` with the original signal and with ``-signal``.
+    Spearman's correlation obeys ``rho(-x, y) == -rho(x, y)`` exactly, so the
+    inverse direction can never have a larger absolute IC.  Its purpose is to
+    identify a statistically significant signal whose orientation is wrong:
+    the advisor can then recommend multiplying that signal by ``-1``.
+
+    Dates are sorted chronologically and split exactly as in
+    :func:`quant_metrics.cross_validate_signal`: the first
+    ``floor(len(dates) * train_ratio)`` dates are the in-sample (IS) split and
+    the remainder are the out-of-sample (OOS) split.  The orientation is
+    decided from the IS mean IC only.  The selected sign is then applied to
+    the OOS split; an opposing OOS result can never change the IS decision.
+
+    Args:
+        signal_values: Signal matrix (rows=dates, columns=stocks).
+        forward_returns: Forward-return matrix with matching labels.
+        train_ratio: Fraction of aligned dates assigned to the IS split.
+        ic_threshold: Minimum absolute IS IC required for significance.
+        p_value_threshold: Maximum IS p-value required for significance.
+        min_periods: Minimum usable IS IC dates required for the sign
+            decision.  The same minimum independently gates OOS reporting;
+            OOS availability never gates the IS decision.
+
+    Returns:
+        A JSON-safe dictionary. Numeric values are plain ``float``/``int``,
+        unavailable values are ``None``, and no NaN or infinity is emitted.
+        The complete key set is:
+
+        - ``direct_mean_ic`` / ``inverse_mean_ic``: full-sample direct and
+          inverse mean IC (``float`` or ``None``).
+        - ``absolute_ic``: absolute full-sample direct mean IC.
+        - ``train_mean_ic`` / ``train_p_value`` / ``train_num_periods``:
+          direct IS mean IC, p-value, and usable IC-date count.
+        - ``inverse_train_mean_ic``: inverse IS mean IC.
+        - ``test_mean_ic`` / ``test_p_value`` / ``test_num_periods``:
+          direct OOS mean IC, p-value, and usable IC-date count.
+        - ``inverse_test_mean_ic``: inverse OOS mean IC.
+        - ``oriented_test_mean_ic`` / ``oriented_test_p_value``: OOS values
+          after applying the already-fixed IS sign; both are ``None`` when OOS
+          reporting is insufficient or no IS sign exists.
+        - ``detected_sign``: ``-1`` for negative IS orientation, ``1`` for
+          positive, and ``0`` when no IS decision exists.
+        - ``decision``: ``"negative"``, ``"positive"``, or ``"none"``.
+        - ``decision_reason``: ``None`` when an IS sign decision exists;
+          otherwise ``"insufficient_in_sample_periods"``,
+          ``"unavailable_in_sample_ic"``, ``"zero_in_sample_ic"``, or
+          ``"directional_ic_computation_failed"``.  The last value means the
+          directional-IC computation failed and the workflow continued with a
+          safe no-decision fallback.
+        - ``is_significant``: whether the IS mean IC and p-value satisfy the
+          configured thresholds.
+        - ``should_invert``: true only for a significant negative IS
+          orientation.
+        - ``oos_reason``: ``None`` when oriented OOS values are reported;
+          otherwise ``"insufficient_out_of_sample_periods"``,
+          ``"unavailable_out_of_sample_ic"``,
+          ``"no_in_sample_decision"``, or
+          ``"directional_ic_computation_failed"``.  The last value means the
+          directional-IC computation failed and the workflow continued with a
+          safe fallback that reports no oriented OOS values.
+        - ``split_date``: first OOS date in ISO format, or ``None``.
+        - ``error``: actual invalid-input/computation error text, or ``None``.
+          Insufficient sample sizes are reported through the reason fields,
+          not through this key.
+    """
+    payload = _directional_ic_payload()
+
+    try:
+        ratio = float(train_ratio)
+    except (TypeError, ValueError):
+        ratio = math.nan
+    if not math.isfinite(ratio) or ratio <= 0 or ratio >= 1:
+        payload["error"] = "train_ratio must be between 0 and 1"
+        logger.warning("Directional IC skipped: %s", payload["error"])
+        return payload
+
+    try:
+        minimum_periods = int(min_periods)
+    except (TypeError, ValueError):
+        minimum_periods = 0
+    if minimum_periods < 1:
+        payload["error"] = "min_periods must be a positive integer"
+        logger.warning("Directional IC skipped: %s", payload["error"])
+        return payload
+
+    if not isinstance(signal_values, pd.DataFrame) or not isinstance(forward_returns, pd.DataFrame):
+        payload["error"] = "signal_values and forward_returns must be DataFrames"
+        return payload
+
+    common_dates = signal_values.index.intersection(forward_returns.index).sort_values()
+    common_stocks = signal_values.columns.intersection(forward_returns.columns)
+    if len(common_dates) == 0 or len(common_stocks) == 0:
+        payload["error"] = "No common dates or stocks between signal and returns"
+        return payload
+
+    train_count = int(len(common_dates) * ratio)
+    train_dates = common_dates[:train_count]
+    test_dates = common_dates[train_count:]
+
+    aligned_signal = signal_values.loc[common_dates, common_stocks]
+    aligned_returns = forward_returns.loc[common_dates, common_stocks]
+    train_signal = aligned_signal.loc[train_dates]
+    train_returns = aligned_returns.loc[train_dates]
+    test_signal = aligned_signal.loc[test_dates]
+    test_returns = aligned_returns.loc[test_dates]
+
+    def rank_ic_snapshot(values: pd.DataFrame, returns: pd.DataFrame) -> dict[str, Any]:
+        """Call the legacy rank-IC function without leaking its key set."""
+        try:
+            result = compute_rank_ic(values, returns)
+        except Exception as exc:
+            logger.warning("Directional rank-IC computation failed: %s", exc)
+            return {}
+        return result if isinstance(result, dict) else {}
+
+    direct_result = rank_ic_snapshot(aligned_signal, aligned_returns)
+    try:
+        inverse_signal = -aligned_signal
+    except Exception as exc:
+        payload["error"] = f"Could not invert signal values: {exc}"
+        logger.warning("Directional IC skipped: %s", payload["error"])
+        return payload
+
+    inverse_result = rank_ic_snapshot(inverse_signal, aligned_returns)
+    train_result = rank_ic_snapshot(train_signal, train_returns)
+    inverse_train_result = rank_ic_snapshot(-train_signal, train_returns)
+    test_result = rank_ic_snapshot(test_signal, test_returns)
+    inverse_test_result = rank_ic_snapshot(-test_signal, test_returns)
+
+    direct_mean_ic = _finite_float(direct_result.get("mean_ic"))
+    inverse_mean_ic = _finite_float(inverse_result.get("mean_ic"))
+    train_mean_ic = _finite_float(train_result.get("mean_ic"))
+    train_p_value = _finite_float(train_result.get("p_value"))
+    train_num_periods = _plain_period_count(train_result.get("num_periods"))
+    inverse_train_mean_ic = _finite_float(inverse_train_result.get("mean_ic"))
+    test_mean_ic = _finite_float(test_result.get("mean_ic"))
+    test_p_value = _finite_float(test_result.get("p_value"))
+    test_num_periods = _plain_period_count(test_result.get("num_periods"))
+    inverse_test_mean_ic = _finite_float(inverse_test_result.get("mean_ic"))
+
+    payload.update(
+        {
+            "direct_mean_ic": direct_mean_ic,
+            "inverse_mean_ic": inverse_mean_ic,
+            "absolute_ic": abs(direct_mean_ic) if direct_mean_ic is not None else None,
+            "train_mean_ic": train_mean_ic,
+            "train_p_value": train_p_value,
+            "train_num_periods": train_num_periods,
+            "inverse_train_mean_ic": inverse_train_mean_ic,
+            "test_mean_ic": test_mean_ic,
+            "test_p_value": test_p_value,
+            "test_num_periods": test_num_periods,
+            "inverse_test_mean_ic": inverse_test_mean_ic,
+        }
+    )
+
+    # The IS sign is the ONLY input to the orientation decision.  OOS sample
+    # availability and values are deliberately excluded from this condition:
+    # they may gate OOS reporting below, but can never create, suppress, or
+    # change the IS-derived decision.
+    decision_reason = None
+    if train_num_periods < minimum_periods:
+        detected_sign = 0
+        decision = "none"
+        decision_reason = "insufficient_in_sample_periods"
+        logger.warning(
+            "Directional IC decision suppressed: insufficient in-sample periods "
+            f"({train_num_periods} < {minimum_periods})"
+        )
+    elif train_mean_ic is None:
+        detected_sign = 0
+        decision = "none"
+        decision_reason = "unavailable_in_sample_ic"
+        logger.warning("Directional IC decision suppressed: in-sample mean IC is unavailable")
+    elif train_mean_ic < 0:
+        detected_sign = -1
+        decision = "negative"
+    elif train_mean_ic > 0:
+        detected_sign = 1
+        decision = "positive"
+    else:
+        detected_sign = 0
+        decision = "none"
+        decision_reason = "zero_in_sample_ic"
+        logger.warning("Directional IC decision suppressed: in-sample mean IC is zero")
+
+    ic_limit = _finite_float(ic_threshold)
+    p_limit = _finite_float(p_value_threshold)
+    is_significant = bool(
+        detected_sign != 0
+        and train_mean_ic is not None
+        and train_p_value is not None
+        and ic_limit is not None
+        and p_limit is not None
+        and ic_limit >= 0
+        and 0 <= p_limit <= 1
+        and abs(train_mean_ic) >= ic_limit
+        and train_p_value <= p_limit
+    )
+
+    # OOS sufficiency gates only OOS reporting/application.  The IS decision
+    # above remains valid even when this branch suppresses oriented OOS values.
+    oriented_test_mean_ic = None
+    oriented_test_p_value = None
+    oos_reason = None
+    if test_num_periods < minimum_periods:
+        oos_reason = "insufficient_out_of_sample_periods"
+        logger.warning(
+            "Directional IC out-of-sample reporting suppressed: insufficient "
+            f"out-of-sample periods ({test_num_periods} < {minimum_periods})"
+        )
+    elif test_mean_ic is None:
+        oos_reason = "unavailable_out_of_sample_ic"
+        logger.warning("Directional IC out-of-sample reporting suppressed: OOS mean IC is unavailable")
+    elif detected_sign == 0:
+        oos_reason = "no_in_sample_decision"
+        logger.warning("Directional IC out-of-sample reporting suppressed: no in-sample decision")
+    elif detected_sign == 1:
+        oriented_test_mean_ic = test_mean_ic
+        oriented_test_p_value = test_p_value
+    else:
+        oriented_test_mean_ic = _finite_float(inverse_test_result.get("mean_ic"))
+        oriented_test_p_value = _finite_float(inverse_test_result.get("p_value"))
+
+    if len(test_dates) > 0:
+        try:
+            split_date = pd.Timestamp(test_dates[0]).isoformat()
+        except (TypeError, ValueError):
+            split_date = str(test_dates[0])
+    else:
+        split_date = None
+
+    payload.update(
+        {
+            "oriented_test_mean_ic": oriented_test_mean_ic,
+            "oriented_test_p_value": oriented_test_p_value,
+            "detected_sign": int(detected_sign),
+            "decision": decision,
+            "decision_reason": decision_reason,
+            "is_significant": bool(is_significant),
+            "should_invert": bool(detected_sign == -1 and is_significant),
+            "oos_reason": oos_reason,
+            "split_date": split_date,
+        }
+    )
+    return payload
 
 
 def evaluate_signal(

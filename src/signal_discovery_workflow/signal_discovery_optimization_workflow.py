@@ -28,6 +28,7 @@ iteration, scoring, feedback, and persisting accepted/best results.
 import asyncio
 import json
 import logging
+import math
 import uuid
 import warnings
 from datetime import datetime
@@ -46,6 +47,7 @@ from pydantic import Field
 from .llm_utils import NO_THINK_INSTRUCTION, extract_json_array, extract_response_text
 from .signal_code_generator import _python_function_name, generate_signal_code
 from .signal_evaluator import (
+    compute_directional_ic,
     compute_forward_returns,
     compute_rank_ic,
     execute_signal_code,
@@ -72,6 +74,51 @@ _STATUS_HEADLINE = {
     "best_effort": "Best-effort result (IC threshold not met)",
     "failed": "No valid signals generated",
 }
+
+
+def _eligible_crossover_parent_count(history_entries: list[tuple[int, str, dict, dict]]) -> int:
+    """Count candidates that :func:`select_parents` can use as parents."""
+    count = 0
+    for _, _, signal, metric in history_entries:
+        if not isinstance(signal, dict) or not isinstance(metric, dict):
+            continue
+        try:
+            mean_ic = float(metric.get("mean_ic"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(mean_ic):
+            count += 1
+    return count
+
+
+def _directional_inversion_advice(ic_results: dict) -> str | None:
+    """Return deterministic sign-inversion advice when warranted.
+
+    The directional-IC payload makes the decision from the in-sample split
+    only.  A missing, inconclusive, or non-significant payload produces no
+    advice, so a weak signal never receives a misleading inversion request.
+    """
+    directional = ic_results.get("directional_ic")
+    if not isinstance(directional, dict) or not directional.get("should_invert"):
+        return None
+
+    train_mean_ic = directional.get("train_mean_ic")
+    train_p_value = directional.get("train_p_value")
+    try:
+        ic_text = f"{float(train_mean_ic):.4f}"
+    except (TypeError, ValueError):
+        ic_text = "N/A"
+    try:
+        p_value_text = f"{float(train_p_value):.4f}"
+    except (TypeError, ValueError):
+        p_value_text = "N/A"
+
+    return (
+        "DIRECTIONAL IC CHECK: the in-sample IC is negative "
+        f"(mean IC {ic_text}, p-value {p_value_text}) and is statistically significant. "
+        "INVERT THE SIGNAL SIGN (multiply the signal by -1) so higher signal values "
+        "predict higher forward returns."
+    )
 
 
 def _compose_feedback(
@@ -302,6 +349,12 @@ def _format_workflow_result(
     if ic_results.get("error"):
         payload["error"] = ic_results["error"]
 
+    # Directional IC is additive and present only when its config flag was
+    # enabled during evaluation.  Keep the legacy payload key set otherwise.
+    directional_ic = ic_results.get("directional_ic")
+    if isinstance(directional_ic, dict):
+        payload["directional_ic"] = directional_ic
+
     if last_feedback:
         payload["last_feedback"] = last_feedback
 
@@ -423,12 +476,20 @@ class SignalOptimizerConfig(FunctionBaseConfig, name="signal_optimizer"):
         default=False, description="Breed the two best signals into an extra crossover candidate"
     )
     genetic_parents: int = Field(default=2, description="Top-|IC| parents feeding the crossover prompt")
+    crossover_fallback_enabled: bool = Field(
+        default=False,
+        description="Use earlier same-run parents when the current iteration has fewer than two parents",
+    )
     skeptic_review: bool = Field(
         default=False, description="Run a pre-backtest skeptic review of each candidate"
     )
     skeptic_llm: str | None = Field(
         default=None,
         description="Optional LLM for the skeptic review; None runs deterministic static checks only",
+    )
+    directional_ic_enabled: bool = Field(
+        default=False,
+        description="Detect statistically significant signals oriented in the wrong direction",
     )
     oos_validation: bool = Field(
         default=False, description="In-sample/out-of-sample IC split to detect overfitting"
@@ -505,6 +566,44 @@ async def signal_optimizer_function(config: SignalOptimizerConfig, builder: Buil
                 oos_data_out["forward_returns"] = forward_returns
             ic_results = compute_rank_ic(signal_values, forward_returns)
 
+            # Sign-aware directional IC is opt-in.  Its orientation decision
+            # uses the in-sample split only; the same sign is then applied to
+            # the out-of-sample split by ``compute_directional_ic``.
+            if config.directional_ic_enabled:
+                try:
+                    ic_results["directional_ic"] = compute_directional_ic(
+                        signal_values,
+                        forward_returns,
+                        train_ratio=config.oos_train_ratio,
+                        ic_threshold=config.ic_threshold,
+                        p_value_threshold=config.p_value_threshold,
+                    )
+                except Exception as exc:
+                    logger.warning(f"Directional IC unavailable; continuing without a decision: {exc}")
+                    ic_results["directional_ic"] = {
+                        "direct_mean_ic": None,
+                        "inverse_mean_ic": None,
+                        "absolute_ic": None,
+                        "train_mean_ic": None,
+                        "train_p_value": None,
+                        "train_num_periods": 0,
+                        "inverse_train_mean_ic": None,
+                        "test_mean_ic": None,
+                        "test_p_value": None,
+                        "test_num_periods": 0,
+                        "inverse_test_mean_ic": None,
+                        "oriented_test_mean_ic": None,
+                        "oriented_test_p_value": None,
+                        "detected_sign": 0,
+                        "decision": "none",
+                        "decision_reason": "directional_ic_computation_failed",
+                        "is_significant": False,
+                        "should_invert": False,
+                        "oos_reason": "directional_ic_computation_failed",
+                        "split_date": None,
+                        "error": str(exc),
+                    }
+
             # Portfolio metrics (Sharpe, Sortino, drawdowns, turnover, ...).
             # The workflow consumes DAILY bars (`forward_periods` is in days),
             # so periods_per_year=252. Lazy import: quant_metrics may be absent,
@@ -542,6 +641,15 @@ async def signal_optimizer_function(config: SignalOptimizerConfig, builder: Buil
         if mean_ic is None or abs(mean_ic) < config.ic_threshold:
             return False
         if p_value is not None and p_value > config.p_value_threshold:
+            return False
+        directional = ic_results.get("directional_ic")
+        if isinstance(directional, dict) and directional.get("should_invert"):
+            # The magnitude is significant, but the IS-derived orientation is
+            # wrong.  Ask the advisor to invert it instead of accepting it.
+            logger.info(
+                "Signal acceptance deferred: the significant in-sample IC has a negative "
+                "orientation; the advisor will be asked to invert the signal sign"
+            )
             return False
         return True
 
@@ -713,6 +821,7 @@ No prose, no preamble. Format:
         skeptic_enabled = bool(getattr(config, "skeptic_review", False))
         genetic_enabled = bool(getattr(config, "genetic_crossover", False))
         genetic_parents_k = max(2, int(getattr(config, "genetic_parents", 2)))
+        crossover_fallback_enabled = bool(getattr(config, "crossover_fallback_enabled", False))
         oos_validation_enabled = bool(getattr(config, "oos_validation", False))
         oos_reject_overfit = bool(getattr(config, "oos_reject_overfit", False))
         oos_train_ratio = float(getattr(config, "oos_train_ratio", 0.7))
@@ -728,13 +837,73 @@ No prose, no preamble. Format:
         # parents are selected from (capped to the most recent entries).
         carryover: list[dict] = []
         candidate_history: list[tuple[dict, dict]] = []
+        # Parallel metadata used only by the opt-in earlier-iteration fallback.
+        # Each entry is ``(iteration, run_id, signal, metrics)`` so a fallback
+        # can prove that every parent belongs to this run and an earlier
+        # iteration of it.
+        candidate_history_context: list[tuple[int, str, dict, dict]] = []
         last_skeptic_reviews: list[dict] = []
 
-        async def generate_crossover_candidate() -> dict | None:
+        async def generate_crossover_candidate(current_iteration: int) -> dict | None:
             """Breed the two best evaluated candidates into ONE new hypothesis."""
             history_signals = [signal for signal, _ in candidate_history]
             history_metrics = [metric for _, metric in candidate_history]
-            parents = select_parents(history_signals, history_metrics, k=genetic_parents_k)
+
+            if not crossover_fallback_enabled:
+                # Legacy path: select from the complete per-run history exactly
+                # as before.  The fallback flag must not alter this behavior.
+                parents = select_parents(history_signals, history_metrics, k=genetic_parents_k)
+            else:
+                current_entries = [
+                    entry
+                    for entry in candidate_history_context
+                    if entry[0] == current_iteration and entry[1] == run_id
+                ]
+                current_count = _eligible_crossover_parent_count(current_entries)
+
+                if current_count >= 2:
+                    # The current iteration already supplies enough parents, so
+                    # retain the existing selection path unchanged.
+                    parents = select_parents(history_signals, history_metrics, k=genetic_parents_k)
+                else:
+                    earlier_entries = [
+                        entry
+                        for entry in candidate_history_context
+                        if entry[0] < current_iteration and entry[1] == run_id
+                    ]
+                    earlier_count = _eligible_crossover_parent_count(earlier_entries)
+                    earlier_signals = [entry[2] for entry in earlier_entries]
+                    earlier_metrics = [entry[3] for entry in earlier_entries]
+                    parents = select_parents(earlier_signals, earlier_metrics, k=genetic_parents_k)
+                    if len(parents) < 2:
+                        if current_count + earlier_count < 2:
+                            logger.warning(
+                                "Genetic crossover fallback skipped: fewer than two evaluated parents "
+                                f"exist across run {run_id} (current iteration={current_count}, "
+                                f"earlier iterations={earlier_count})"
+                            )
+                        else:
+                            logger.warning(
+                                "Genetic crossover fallback skipped: earlier iterations of run "
+                                f"{run_id} contain fewer than two eligible parents "
+                                f"(current iteration={current_count}, earlier iterations={earlier_count})"
+                            )
+                        return None
+
+                    selected_parent_ids = {id(parent) for parent in parents}
+                    source_iterations = sorted(
+                        {
+                            entry[0]
+                            for entry in earlier_entries
+                            if id(entry[2]) in selected_parent_ids
+                        }
+                    )
+                    logger.info(
+                        "Genetic crossover fallback: using "
+                        f"{len(parents)} parent(s) from earlier iteration(s) "
+                        f"{source_iterations} of run {run_id}"
+                    )
+
             if len(parents) < 2:
                 logger.info("Genetic crossover skipped: fewer than two evaluated parents")
                 return None
@@ -868,8 +1037,10 @@ No prose, no preamble. Format:
                 for item in extract_json_array(signal_json):
                     if isinstance(item, dict):
                         candidate_history.append((item, ic_results))
+                        candidate_history_context.append((iteration, run_id, item, ic_results))
                 if len(candidate_history) > 50:
                     candidate_history = candidate_history[-50:]
+                    candidate_history_context = candidate_history_context[-50:]
 
             # With evolution tracking on, persist EVERY iteration so the
             # dashboard can render idea -> iteration -> final signal trees.
@@ -958,6 +1129,13 @@ No prose, no preamble. Format:
                     f"\n{advice}"
                 )
 
+            # A significant negative IS orientation gets a deterministic note
+            # in addition to the advisor's bullets.  This advice is part of the
+            # composed feedback passed to the next iteration.
+            inversion_advice = _directional_inversion_advice(ic_results)
+            if inversion_advice:
+                advice = f"{inversion_advice}\n{advice}"
+
             # Compose the feedback shown to the next iteration: anchor it on
             # the best-known result so the model has a concrete target to
             # beat, then append the advisor's bullets (or arity errors).
@@ -965,7 +1143,7 @@ No prose, no preamble. Format:
 
             # ---- genetic crossover: breed the best candidates ----
             if genetic_enabled:
-                crossover_candidate = await generate_crossover_candidate()
+                crossover_candidate = await generate_crossover_candidate(iteration)
                 if crossover_candidate is not None:
                     carryover.append(crossover_candidate)
 

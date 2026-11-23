@@ -68,8 +68,10 @@ workflow:
   max_concurrency: 4              # max simultaneous LLM calls when parallel_generation is on
   genetic_crossover: false        # breed the two best signals into a new candidate
   genetic_parents: 2              # how many top-|IC| parents feed the crossover prompt
+  crossover_fallback_enabled: false # reuse earlier same-run parents when the current iteration has <2
   skeptic_review: false           # run a pre-backtest skeptic review of each candidate
   skeptic_llm: null               # optional LLM block for the review; null = static checks only
+  directional_ic_enabled: false  # detect significant signals oriented in the wrong direction
   oos_validation: false           # in-sample/out-of-sample check to detect overfitting
   oos_train_ratio: 0.7            # share of history used for the in-sample split
   oos_reject_overfit: false       # refuse to accept a signal flagged as overfit

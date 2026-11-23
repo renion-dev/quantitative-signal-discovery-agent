@@ -113,9 +113,19 @@ async def _fake_codegen(llm, signal_json, operators, errors_out=None):
     return "\n".join(blocks)
 
 
-def _setup_workflow(monkeypatch, tmp_path, config, llms, ic_results=None):
+def _setup_workflow(
+    monkeypatch,
+    tmp_path,
+    config,
+    llms,
+    ic_results=None,
+    stock_data=None,
+    signal_values=None,
+    forward_returns=None,
+    use_real_rank_ic=False,
+):
     """Monkeypatch the evaluation stack; return (run_optimization, state)."""
-    data = _stock_data()
+    data = stock_data if stock_data is not None else _stock_data()
     monkeypatch.setattr(workflow, "load_stock_data", lambda: data)
     monkeypatch.setattr(workflow, "OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(workflow, "generate_signal_code", _fake_codegen)
@@ -125,7 +135,8 @@ def _setup_workflow(monkeypatch, tmp_path, config, llms, ic_results=None):
 
     def fake_execute(code, stock_data, selection_periods=5):
         state.evaluated_codes.append(code)
-        return data["Close"], "signal_alpha"
+        evaluated_signal = signal_values if signal_values is not None else data["Close"]
+        return evaluated_signal, "signal_alpha"
 
     def fake_rank_ic(signal_values, forward_returns):
         result = (
@@ -137,8 +148,12 @@ def _setup_workflow(monkeypatch, tmp_path, config, llms, ic_results=None):
         return result
 
     monkeypatch.setattr(workflow, "execute_signal_code", fake_execute)
-    monkeypatch.setattr(workflow, "compute_forward_returns", lambda close, periods=5: close.copy())
-    monkeypatch.setattr(workflow, "compute_rank_ic", fake_rank_ic)
+    if forward_returns is None:
+        monkeypatch.setattr(workflow, "compute_forward_returns", lambda close, periods=5: close.copy())
+    else:
+        monkeypatch.setattr(workflow, "compute_forward_returns", lambda close, periods=5: forward_returns.copy())
+    if not use_real_rank_ic:
+        monkeypatch.setattr(workflow, "compute_rank_ic", fake_rank_ic)
 
     class _Builder:
         async def get_llm(self, llm_name, wrapper_type=None):
@@ -489,6 +504,445 @@ class TestOOSGate:
         assert "oos_validation" not in result
         saved = json.loads(Path(result["saved_path"]).read_text())
         assert "oos_validation" not in saved["evaluation_metrics"]
+
+
+# ---------------------------------------------------------------------------
+# Sign-aware directional IC
+# ---------------------------------------------------------------------------
+
+
+def _directional_payload(*, sign=1, should_invert=False, significant=True):
+    mean_ic = 0.05 if sign >= 0 else -0.05
+    return {
+        "direct_mean_ic": mean_ic,
+        "inverse_mean_ic": -mean_ic,
+        "absolute_ic": abs(mean_ic),
+        "train_mean_ic": mean_ic,
+        "train_p_value": 0.01,
+        "train_num_periods": 70,
+        "inverse_train_mean_ic": -mean_ic,
+        "test_mean_ic": mean_ic,
+        "test_p_value": 0.02,
+        "test_num_periods": 30,
+        "inverse_test_mean_ic": -mean_ic,
+        "oriented_test_mean_ic": mean_ic if sign >= 0 else -mean_ic,
+        "oriented_test_p_value": 0.02,
+        "detected_sign": sign,
+        "decision": "positive" if sign >= 0 else "negative",
+        "decision_reason": None,
+        "is_significant": significant,
+        "should_invert": should_invert,
+        "oos_reason": None,
+        "split_date": "2024-02-15",
+        "error": None,
+    }
+
+
+class TestDirectionalICWorkflow:
+    @staticmethod
+    def _negative_directional_frames(n_dates):
+        rng = np.random.default_rng(0)
+        dates = pd.bdate_range("2024-01-01", periods=n_dates)
+        columns = [f"S{i}" for i in range(20)]
+        returns = pd.DataFrame(rng.standard_normal((n_dates, 20)), index=dates, columns=columns)
+        noise_rng = np.random.default_rng(1)
+        signal = -returns + noise_rng.standard_normal(returns.shape) * 0.2
+        return returns, signal
+
+    def test_significant_negative_orientation_adds_inversion_advice(self, monkeypatch, tmp_path):
+        config = _config(
+            max_iterations=2,
+            num_signals=1,
+            directional_ic_enabled=True,
+        )
+        signal_llm = _ScriptedLLM(
+            [
+                _signal_reply(_signal("First")),
+                _signal_reply(_signal("Second")),
+            ]
+        )
+        advisor_llm = _ScriptedLLM(["- try a different formulation"])
+        single_fn, _ = _setup_workflow(
+            monkeypatch,
+            tmp_path,
+            config,
+            {"signal": signal_llm, "codegen": _ScriptedLLM([]), "advisor": advisor_llm},
+        )
+        directional_results = [
+            _directional_payload(sign=-1, should_invert=True),
+            _directional_payload(sign=1, should_invert=False),
+        ]
+        monkeypatch.setattr(
+            workflow,
+            "compute_directional_ic",
+            lambda *args, **kwargs: directional_results.pop(0),
+        )
+
+        result = _run(single_fn)
+
+        assert result["status"] == "accepted"
+        assert result["iteration"] == 2
+        assert "invert the signal sign" in signal_llm.prompts[1].lower()
+        assert "invert the signal sign" in result["last_feedback"].lower()
+        assert advisor_llm.calls == 1
+
+    def test_acceptance_is_identical_for_short_and_long_oos(self, monkeypatch, tmp_path, caplog):
+        config = _config(
+            max_iterations=1,
+            num_signals=1,
+            directional_ic_enabled=True,
+            save_results=False,
+        )
+        results = {}
+
+        with caplog.at_level(logging.INFO):
+            for label, n_dates in (("short_oos", 50), ("long_oos", 100)):
+                returns, signal = self._negative_directional_frames(n_dates)
+                signal_llm = _ScriptedLLM([_signal_reply(_signal("Same candidate"))])
+                advisor_llm = _ScriptedLLM(["- try another formulation"])
+                single_fn, _ = _setup_workflow(
+                    monkeypatch,
+                    tmp_path,
+                    config,
+                    {"signal": signal_llm, "codegen": _ScriptedLLM([]), "advisor": advisor_llm},
+                    stock_data={"Close": returns},
+                    signal_values=signal,
+                    forward_returns=returns,
+                    use_real_rank_ic=True,
+                )
+
+                results[label] = _run(single_fn)
+                results[label]["_advisor_calls"] = advisor_llm.calls
+
+        short = results["short_oos"]
+        long = results["long_oos"]
+        assert short["directional_ic"]["test_num_periods"] == 15
+        assert long["directional_ic"]["test_num_periods"] == 30
+        assert short["directional_ic"]["should_invert"] is True
+        assert long["directional_ic"]["should_invert"] is True
+        assert short["status"] == long["status"] == "best_effort"
+        assert short["_advisor_calls"] == long["_advisor_calls"] == 1
+        assert "invert the signal sign" in short["last_feedback"].lower()
+        assert "invert the signal sign" in long["last_feedback"].lower()
+        assert "Signal acceptance deferred" in caplog.text
+
+    def test_no_decision_is_json_safe_and_adds_no_inversion_advice(self, monkeypatch, tmp_path):
+        config = _config(max_iterations=1, num_signals=1, directional_ic_enabled=True)
+        signal_llm = _ScriptedLLM([_signal_reply(_signal("Neutral"))])
+        advisor_llm = _ScriptedLLM(["- try x"])
+        single_fn, _ = _setup_workflow(
+            monkeypatch,
+            tmp_path,
+            config,
+            {"signal": signal_llm, "codegen": _ScriptedLLM([]), "advisor": advisor_llm},
+        )
+        payload = _directional_payload(sign=0, should_invert=False, significant=False)
+        payload["decision"] = "none"
+        payload["decision_reason"] = "insufficient_in_sample_periods"
+        payload["detected_sign"] = 0
+        monkeypatch.setattr(workflow, "compute_directional_ic", lambda *args, **kwargs: payload)
+
+        result = _run(single_fn)
+
+        assert result["status"] == "accepted"
+        assert result["directional_ic"]["decision"] == "none"
+        assert "invert" not in " ".join(signal_llm.prompts).lower()
+        assert advisor_llm.calls == 0
+        json.dumps(result, allow_nan=False)
+
+    def test_reason_variants_for_directional_ic_computation_failure(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        config = _config(max_iterations=1, num_signals=1, directional_ic_enabled=True)
+        signal_llm = _ScriptedLLM([_signal_reply(_signal("Failure fallback"))])
+        single_fn, _ = _setup_workflow(
+            monkeypatch,
+            tmp_path,
+            config,
+            {
+                "signal": signal_llm,
+                "codegen": _ScriptedLLM([]),
+                "advisor": _ScriptedLLM(["- try x"]),
+            },
+        )
+
+        def fail_directional_ic(*args, **kwargs):
+            raise RuntimeError("forced directional failure")
+
+        monkeypatch.setattr(workflow, "compute_directional_ic", fail_directional_ic)
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(single_fn)
+
+        payload = result["directional_ic"]
+        assert payload["decision_reason"] == "directional_ic_computation_failed"
+        assert payload["oos_reason"] == "directional_ic_computation_failed"
+        assert payload["decision"] == "none"
+        assert payload["detected_sign"] == 0
+        assert payload["is_significant"] is False
+        assert payload["should_invert"] is False
+        assert payload["error"] == "forced directional failure"
+        assert "Directional IC unavailable; continuing without a decision" in caplog.text
+        assert result["status"] == "accepted"
+
+    def test_enabled_flag_adds_payload_and_saved_metric(self, monkeypatch, tmp_path):
+        config = _config(max_iterations=1, num_signals=1, directional_ic_enabled=True)
+        signal_llm = _ScriptedLLM([_signal_reply(_signal("Positive"))])
+        single_fn, _ = _setup_workflow(
+            monkeypatch,
+            tmp_path,
+            config,
+            {"signal": signal_llm, "codegen": _ScriptedLLM([]), "advisor": _ScriptedLLM(["- try x"])},
+        )
+        monkeypatch.setattr(
+            workflow,
+            "compute_directional_ic",
+            lambda *args, **kwargs: _directional_payload(sign=1),
+        )
+
+        result = _run(single_fn)
+
+        assert result["directional_ic"]["decision"] == "positive"
+        saved = json.loads(Path(result["saved_path"]).read_text())
+        assert saved["evaluation_metrics"]["directional_ic"]["decision"] == "positive"
+
+    def test_disabled_flag_keeps_exact_workflow_and_saved_key_sets(self, monkeypatch, tmp_path):
+        config = _config(max_iterations=1, num_signals=1, save_evolution=False)
+        signal_llm = _ScriptedLLM([_signal_reply(_signal("Legacy"))])
+        single_fn, _ = _setup_workflow(
+            monkeypatch,
+            tmp_path,
+            config,
+            {"signal": signal_llm, "codegen": _ScriptedLLM([]), "advisor": _ScriptedLLM(["- try x"])},
+        )
+
+        result = _run(single_fn)
+
+        # The workflow output already carried run_id before this feature; the
+        # exact baseline key set must not gain directional_ic when disabled.
+        assert set(result) == set(LEGACY_PAYLOAD_KEYS) | {"run_id"}
+        assert "directional_ic" not in result
+        saved = json.loads(Path(result["saved_path"]).read_text())
+        assert set(saved) == {
+            "timestamp",
+            "iteration",
+            "selected_signal",
+            "signal_description",
+            "signal_code",
+            "evaluation_metrics",
+        }
+        assert "directional_ic" not in saved["evaluation_metrics"]
+
+
+# ---------------------------------------------------------------------------
+# Crossover fallback to earlier iterations of the same run
+# ---------------------------------------------------------------------------
+
+
+class TestCrossoverFallback:
+    @staticmethod
+    def _weak_results(count):
+        return [
+            {"mean_ic": 0.001, "p_value": 0.4, "num_periods": 20}
+            for _ in range(count)
+        ]
+
+    def test_uses_earlier_same_run_parents_and_logs_source(self, monkeypatch, tmp_path, caplog):
+        config = _config(
+            max_iterations=3,
+            num_signals=1,
+            genetic_crossover=True,
+            crossover_fallback_enabled=True,
+        )
+        signal_llm = _ScriptedLLM(
+            [
+                _signal_reply(_signal("First")),
+                _signal_reply(_signal("Second")),
+                _signal_reply(_signal("Third")),
+                _crossover_reply(),
+            ]
+        )
+        single_fn, _ = _setup_workflow(
+            monkeypatch,
+            tmp_path,
+            config,
+            {"signal": signal_llm, "codegen": _ScriptedLLM([]), "advisor": _ScriptedLLM(["- try x"])},
+            ic_results=self._weak_results(3),
+        )
+
+        with caplog.at_level(logging.INFO):
+            result = _run(single_fn)
+
+        crossover_prompts = [prompt for prompt in signal_llm.prompts if "genetic crossover" in prompt.lower()]
+        assert len(crossover_prompts) == 1
+        assert "PARENT A (First)" in crossover_prompts[0]
+        assert "PARENT B (Second)" in crossover_prompts[0]
+        assert "Third" not in crossover_prompts[0]
+        assert (
+            "Genetic crossover fallback: using 2 parent(s) from earlier iteration(s) [1, 2]"
+            in caplog.text
+        )
+        assert result["status"] == "best_effort"
+
+    def test_fallback_never_crosses_run_ids(self, monkeypatch, tmp_path):
+        config = _config(
+            max_iterations=3,
+            num_signals=1,
+            genetic_crossover=True,
+            crossover_fallback_enabled=True,
+        )
+
+        first_llm = _ScriptedLLM(
+            [
+                _signal_reply(_signal("RunA First")),
+                _signal_reply(_signal("RunA Second")),
+                _signal_reply(_signal("RunA Third")),
+                _crossover_reply(),
+            ]
+        )
+        first_fn, _ = _setup_workflow(
+            monkeypatch,
+            tmp_path,
+            config,
+            {"signal": first_llm, "codegen": _ScriptedLLM([]), "advisor": _ScriptedLLM(["- try x"])},
+            ic_results=self._weak_results(3),
+        )
+        _run(first_fn)
+
+        second_llm = _ScriptedLLM(
+            [
+                _signal_reply(_signal("RunB First")),
+                _signal_reply(_signal("RunB Second")),
+                _signal_reply(_signal("RunB Third")),
+                _crossover_reply(),
+            ]
+        )
+        second_fn, _ = _setup_workflow(
+            monkeypatch,
+            tmp_path,
+            config,
+            {"signal": second_llm, "codegen": _ScriptedLLM([]), "advisor": _ScriptedLLM(["- try x"])},
+            ic_results=self._weak_results(3),
+        )
+        _run(second_fn)
+
+        second_prompts = " ".join(second_llm.prompts)
+        assert "RunB First" in second_prompts
+        assert "RunB Second" in second_prompts
+        assert "RunA First" not in second_prompts
+        assert "RunA Second" not in second_prompts
+
+    def test_graceful_skip_logs_when_whole_run_has_fewer_than_two_parents(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        config = _config(
+            max_iterations=2,
+            num_signals=1,
+            genetic_crossover=True,
+            crossover_fallback_enabled=True,
+        )
+        signal_llm = _ScriptedLLM(
+            [
+                _signal_reply(_signal("Only One")),
+                _signal_reply(_signal("Still One")),
+            ]
+        )
+        single_fn, _ = _setup_workflow(
+            monkeypatch,
+            tmp_path,
+            config,
+            {"signal": signal_llm, "codegen": _ScriptedLLM([]), "advisor": _ScriptedLLM(["- try x"])},
+            ic_results=self._weak_results(2),
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(single_fn)
+
+        assert signal_llm.calls == 2  # no crossover LLM call
+        assert "fewer than two evaluated parents exist across run" in caplog.text
+        assert result["status"] == "best_effort"
+
+    def test_disabled_flag_calls_select_parents_with_exact_legacy_arguments(
+        self, monkeypatch, tmp_path
+    ):
+        config = _config(
+            max_iterations=2,
+            num_signals=1,
+            genetic_crossover=True,
+            crossover_fallback_enabled=False,
+        )
+        signal_llm = _ScriptedLLM(
+            [
+                _signal_reply(_signal("First")),
+                _signal_reply(_signal("Second")),
+                _crossover_reply(),
+            ]
+        )
+        single_fn, _ = _setup_workflow(
+            monkeypatch,
+            tmp_path,
+            config,
+            {"signal": signal_llm, "codegen": _ScriptedLLM([]), "advisor": _ScriptedLLM(["- try x"])},
+            ic_results=self._weak_results(2),
+        )
+
+        def unavailable_portfolio(*args, **kwargs):
+            raise RuntimeError("portfolio disabled for exact argument assertion")
+
+        monkeypatch.setattr(quant_metrics, "build_portfolio_weights", unavailable_portfolio)
+        captured = []
+        real_select_parents = workflow.select_parents
+
+        def recording_select_parents(signals, metrics, k=2):
+            captured.append((signals, metrics, k))
+            return real_select_parents(signals, metrics, k=k)
+
+        monkeypatch.setattr(workflow, "select_parents", recording_select_parents)
+
+        _run(single_fn)
+
+        metric = {
+            "mean_ic": 0.001,
+            "p_value": 0.4,
+            "num_periods": 20,
+            "selected_signal": "signal_alpha",
+        }
+        assert captured == [
+            ([_signal("First")], [metric], 2),
+            ([_signal("First"), _signal("Second")], [metric, metric], 2),
+        ]
+
+    def test_disabled_flag_keeps_legacy_parent_selection_path(self, monkeypatch, tmp_path, caplog):
+        config = _config(
+            max_iterations=3,
+            num_signals=1,
+            genetic_crossover=True,
+            crossover_fallback_enabled=False,
+        )
+        signal_llm = _ScriptedLLM(
+            [
+                _signal_reply(_signal("First")),
+                _signal_reply(_signal("Second")),
+                _crossover_reply(),
+                _signal_reply(_signal("Third")),
+            ]
+        )
+        single_fn, _ = _setup_workflow(
+            monkeypatch,
+            tmp_path,
+            config,
+            {"signal": signal_llm, "codegen": _ScriptedLLM([]), "advisor": _ScriptedLLM(["- try x"])},
+            ic_results=self._weak_results(3),
+        )
+
+        with caplog.at_level(logging.INFO):
+            result = _run(single_fn)
+
+        # Legacy behavior uses the complete per-run history once it contains
+        # two candidates; the opt-in fallback must not change that path.
+        assert any("genetic crossover" in prompt.lower() for prompt in signal_llm.prompts)
+        assert "Genetic crossover fallback" not in caplog.text
+        assert result["status"] == "best_effort"
 
 
 # ---------------------------------------------------------------------------

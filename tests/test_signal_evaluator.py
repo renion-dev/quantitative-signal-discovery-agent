@@ -3,6 +3,7 @@
 
 """Tests for signal_evaluator pure utility functions."""
 
+import json
 import logging
 import sys
 import types
@@ -16,6 +17,7 @@ from signal_discovery_workflow.signal_evaluator import (
     _forward_returns_cache,
     clear_forward_returns_cache,
     clear_operator_cache,
+    compute_directional_ic,
     compute_forward_returns,
     compute_rank_ic,
     compute_signal_turnover,
@@ -223,6 +225,267 @@ class TestComputeRankIC:
         )
         result = compute_rank_ic(signal, returns)
         assert result["num_periods"] > 0
+
+
+# ---------------------------------------------------------------------------
+# compute_directional_ic
+# ---------------------------------------------------------------------------
+
+
+class TestComputeDirectionalIC:
+    _LEGACY_RANK_IC_KEYS = {
+        "mean_ic",
+        "ic_std",
+        "ic_ir",
+        "t_stat",
+        "p_value",
+        "num_periods",
+        "positive_ic_ratio",
+        "ic_percentiles",
+    }
+
+    @staticmethod
+    def _make_returns(n_dates=100, n_stocks=20, seed=0):
+        rng = np.random.default_rng(seed)
+        dates = pd.date_range("2020-01-01", periods=n_dates, freq="B")
+        tickers = [f"S{i:02d}" for i in range(n_stocks)]
+        returns = pd.DataFrame(rng.standard_normal((n_dates, n_stocks)), index=dates, columns=tickers)
+        return returns
+
+    @staticmethod
+    def _correlated_signal(returns, direction=1, noise_scale=0.2, seed=1):
+        rng = np.random.default_rng(seed)
+        noise = rng.standard_normal(returns.shape) * noise_scale
+        return returns * direction + noise
+
+    def test_positive_signal_detects_positive_orientation(self):
+        returns = self._make_returns()
+        signal = self._correlated_signal(returns, direction=1)
+
+        payload = compute_directional_ic(
+            signal,
+            returns,
+            ic_threshold=0.03,
+            p_value_threshold=0.05,
+        )
+
+        assert payload["detected_sign"] == 1
+        assert payload["decision"] == "positive"
+        assert payload["is_significant"] is True
+        assert payload["should_invert"] is False
+        assert payload["train_mean_ic"] > 0.9
+
+    def test_negative_signal_detects_wrong_orientation(self):
+        returns = self._make_returns()
+        signal = self._correlated_signal(returns, direction=-1)
+
+        payload = compute_directional_ic(
+            signal,
+            returns,
+            ic_threshold=0.03,
+            p_value_threshold=0.05,
+        )
+
+        assert payload["detected_sign"] == -1
+        assert payload["decision"] == "negative"
+        assert payload["is_significant"] is True
+        assert payload["should_invert"] is True
+        assert payload["train_mean_ic"] < -0.9
+
+    def test_sufficient_negative_is_decision_survives_short_oos(self, caplog):
+        returns = self._make_returns(n_dates=50, seed=11)
+        signal = self._correlated_signal(returns, direction=-1, seed=12)
+
+        with caplog.at_level(logging.WARNING):
+            payload = compute_directional_ic(
+                signal,
+                returns,
+                train_ratio=0.7,
+                ic_threshold=0.03,
+                p_value_threshold=0.05,
+            )
+
+        assert payload["train_num_periods"] == 35
+        assert payload["test_num_periods"] == 15
+        assert payload["decision"] == "negative"
+        assert payload["decision_reason"] is None
+        assert payload["detected_sign"] == -1
+        assert payload["is_significant"] is True
+        assert payload["should_invert"] is True
+        assert payload["oos_reason"] == "insufficient_out_of_sample_periods"
+        assert payload["oriented_test_mean_ic"] is None
+        assert payload["oriented_test_p_value"] is None
+        assert "insufficient out-of-sample periods" in caplog.text
+
+    def test_sufficient_negative_is_decision_survives_zero_usable_oos(self, caplog):
+        returns = self._make_returns(n_dates=50, seed=13)
+        # Make every OOS row constant, so no OOS date is usable for rank IC.
+        returns.iloc[35:] = 1.0
+        signal = self._correlated_signal(returns, direction=-1, seed=14)
+
+        with caplog.at_level(logging.WARNING):
+            payload = compute_directional_ic(
+                signal,
+                returns,
+                train_ratio=0.7,
+                ic_threshold=0.03,
+                p_value_threshold=0.05,
+            )
+
+        assert payload["train_num_periods"] == 35
+        assert payload["test_num_periods"] == 0
+        assert payload["decision"] == "negative"
+        assert payload["decision_reason"] is None
+        assert payload["detected_sign"] == -1
+        assert payload["is_significant"] is True
+        assert payload["should_invert"] is True
+        assert payload["oos_reason"] == "insufficient_out_of_sample_periods"
+        assert payload["oriented_test_mean_ic"] is None
+        assert "insufficient out-of-sample periods" in caplog.text
+
+    def test_inverse_mean_is_negated_and_absolute_ic_is_unchanged(self):
+        returns = self._make_returns(seed=4)
+
+        payload = compute_directional_ic(returns, returns)
+
+        assert payload["inverse_mean_ic"] == -payload["direct_mean_ic"]
+        assert payload["inverse_train_mean_ic"] == -payload["train_mean_ic"]
+        assert payload["inverse_test_mean_ic"] == -payload["test_mean_ic"]
+        assert abs(payload["inverse_mean_ic"]) == abs(payload["direct_mean_ic"])
+        assert payload["absolute_ic"] == abs(payload["direct_mean_ic"])
+
+    def test_oos_opposite_sign_does_not_flip_is_decision(self):
+        returns = self._make_returns(n_dates=100, seed=8)
+        signal = self._correlated_signal(returns, direction=-1, seed=18)
+        # Replace the OOS rows with a positively oriented signal.  IS remains
+        # negative while OOS is positive; the IS decision must not flip.
+        oos_signal = self._correlated_signal(returns, direction=1, seed=28)
+        signal.iloc[70:] = oos_signal.iloc[70:]
+
+        payload = compute_directional_ic(
+            signal,
+            returns,
+            train_ratio=0.7,
+            ic_threshold=0.03,
+            p_value_threshold=0.05,
+        )
+
+        assert payload["train_mean_ic"] < -0.9
+        assert payload["test_mean_ic"] > 0.9
+        assert payload["detected_sign"] == -1
+        assert payload["should_invert"] is True
+        # The IS-derived sign (-1) is applied to OOS, so the oriented OOS IC
+        # is negative even though the direct OOS IC is positive.
+        assert payload["oriented_test_mean_ic"] < -0.9
+
+    def test_no_decision_payload_is_json_safe_and_does_not_request_inversion(self):
+        returns = self._make_returns(n_dates=10, seed=9)
+
+        payload = compute_directional_ic(returns, returns)
+
+        assert payload["decision"] == "none"
+        assert payload["decision_reason"] == "insufficient_in_sample_periods"
+        assert payload["detected_sign"] == 0
+        assert payload["is_significant"] is False
+        assert payload["oos_reason"] == "insufficient_out_of_sample_periods"
+        assert payload["should_invert"] is False
+        # ``allow_nan=False`` proves that no NaN/Infinity escaped the payload.
+        encoded = json.dumps(payload, allow_nan=False)
+        assert json.loads(encoded) == payload
+
+    def test_reason_variants_for_insufficient_is_and_oos_periods(self, caplog):
+        returns = self._make_returns(n_dates=10, seed=17)
+        signal = self._correlated_signal(returns, direction=1, seed=18)
+
+        with caplog.at_level(logging.WARNING):
+            payload = compute_directional_ic(signal, returns, train_ratio=0.7)
+
+        assert payload["train_num_periods"] == 7
+        assert payload["test_num_periods"] == 3
+        assert payload["decision_reason"] == "insufficient_in_sample_periods"
+        assert payload["oos_reason"] == "insufficient_out_of_sample_periods"
+        assert payload["error"] is None
+        assert "insufficient in-sample periods" in caplog.text
+        assert "insufficient out-of-sample periods" in caplog.text
+
+    def test_reason_variants_for_unavailable_is_and_oos_ic(self, monkeypatch, caplog):
+        returns = self._make_returns(n_dates=100, seed=19)
+        signal = self._correlated_signal(returns, direction=1, seed=20)
+        # A non-finite correlation leaves the usable-date count intact while
+        # making the aggregate IS/OOS IC unavailable.
+        monkeypatch.setattr(se.stats, "spearmanr", lambda *args, **kwargs: (np.inf, None))
+
+        with caplog.at_level(logging.WARNING):
+            payload = compute_directional_ic(signal, returns, train_ratio=0.7)
+
+        assert payload["train_num_periods"] == 70
+        assert payload["test_num_periods"] == 30
+        assert payload["train_mean_ic"] is None
+        assert payload["test_mean_ic"] is None
+        assert payload["decision_reason"] == "unavailable_in_sample_ic"
+        assert payload["oos_reason"] == "unavailable_out_of_sample_ic"
+        assert payload["error"] is None
+        assert "in-sample mean IC is unavailable" in caplog.text
+        assert "OOS mean IC is unavailable" in caplog.text
+
+    def test_reason_variants_for_zero_is_ic_and_no_is_decision(self, caplog):
+        returns = self._make_returns(n_dates=100, seed=21)
+        returns.iloc[:, :] = np.arange(1.0, 21.0)
+        # This permutation has Spearman correlation exactly 0.0 against ranks
+        # 1..20, so every usable IS date has zero IC.
+        zero_ic_permutation = np.array(
+            [19, 10, 14, 4, 9, 8, 6, 13, 3, 20, 1, 18, 12, 2, 17, 5, 15, 16, 7, 11],
+            dtype=float,
+        )
+        signal = pd.DataFrame(
+            np.tile(zero_ic_permutation, (len(returns), 1)),
+            index=returns.index,
+            columns=returns.columns,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            payload = compute_directional_ic(signal, returns, train_ratio=0.7)
+
+        assert payload["train_mean_ic"] == 0.0
+        assert payload["decision_reason"] == "zero_in_sample_ic"
+        assert payload["oos_reason"] == "no_in_sample_decision"
+        assert payload["error"] is None
+        assert "in-sample mean IC is zero" in caplog.text
+        assert "no in-sample decision" in caplog.text
+
+    def test_populated_real_payload_contains_only_plain_json_scalars(self):
+        returns = self._make_returns(n_dates=100, seed=15)
+        signal = self._correlated_signal(returns, direction=-1, seed=16)
+
+        payload = compute_directional_ic(
+            signal,
+            returns,
+            ic_threshold=0.03,
+            p_value_threshold=0.05,
+        )
+
+        assert payload["train_mean_ic"] is not None
+        assert payload["train_p_value"] is not None
+        assert payload["test_mean_ic"] is not None
+        assert payload["oriented_test_mean_ic"] is not None
+
+        def leaves(value):
+            if isinstance(value, dict):
+                for child in value.values():
+                    yield from leaves(child)
+            else:
+                yield value
+
+        allowed_scalar_types = {str, int, float, bool, type(None)}
+        assert all(type(leaf) in allowed_scalar_types for leaf in leaves(payload))
+        assert json.loads(json.dumps(payload, allow_nan=False)) == payload
+
+    def test_compute_rank_ic_legacy_key_set_is_exact(self):
+        returns = self._make_returns(n_dates=40, seed=10)
+
+        result = compute_rank_ic(returns, returns)
+
+        assert set(result) == self._LEGACY_RANK_IC_KEYS
 
 
 # ---------------------------------------------------------------------------
