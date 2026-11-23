@@ -1,0 +1,20 @@
+{
+    "schema_version": "1.0",
+    "description": "Output template for the skeptic agent's pre-backtest signal review",
+    "review_template": {
+        "verdict": "<approve|revise|reject>",
+        "issues": ["<list_of_specific_issues>"],
+        "rationale": "<short_explanation>"
+    },
+    "allowed_verdicts": ["approve", "revise", "reject"],
+    "validation_rules": {
+        "verdict_must_be_one_of_allowed_verdicts": true,
+        "issues_must_be_list_of_strings": true,
+        "rationale_must_be_non_empty_string": true,
+        "verdict_semantics": {
+            "approve": "no lookahead bias, leakage, or degenerate logic",
+            "revise": "promising but has fixable issues; describe what to change",
+            "reject": "unsound (lookahead, leakage, or degenerate logic); must not be backtested"
+        }
+    }
+}

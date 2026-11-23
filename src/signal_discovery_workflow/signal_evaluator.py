@@ -18,11 +18,41 @@ Signal Evaluator: Rank IC computation, signal-code execution, and helpers.
 
 The rank IC measures the Spearman correlation between signal values and forward
 stock returns — a standard quant-research signal-quality metric.
+
+Forward-returns caching
+-----------------------
+Forward returns are cached at module level (``_forward_returns_cache``) so that
+many candidate signals evaluated against the same close prices reuse a single
+precomputed frame instead of recomputing ``close.shift(-periods) / close - 1``
+for every candidate. Cache keys combine the horizon, index/column labels,
+shape, and a cheap *probabilistic* content fingerprint (``_close_fingerprint``)
+— not a cryptographic hash of every value. The fingerprint samples ~64 values,
+so two different datasets colliding on the same key is possible in principle
+but negligible in practice; the trade-off keeps key construction O(rows + cols)
+instead of hashing the full array. Use ``clear_forward_returns_cache()`` to
+reset the cache in long-running processes.
+
+Operator-result caching
+-----------------------
+When enabled (``USE_OPERATOR_CACHE`` or env ``SIGNAL_USE_OPERATOR_CACHE``),
+the operator callables of each candidate module are wrapped IN PLACE with
+``operator_cache.memoize_operator`` after signal-function detection, so
+identical operator calls reuse one cached result — across candidates too,
+since the cache key fingerprints the operator implementation, not object
+identity (different implementations sharing a name never share an entry).
+Cached values are handed out as shallow copies (``copy_on_return=True``).
+The cache is cleared whenever market data is (re)loaded
+(``load_stock_data`` / ``clear_operator_cache``).
+
+LIMITATION: the sandboxed execution path is NOT cached — the sandbox runs
+generated code in its own restricted namespace and does not share the
+evaluator's operator cache.
 """
 
 import inspect
 import json
 import logging
+import os
 import re
 import traceback
 import warnings
@@ -33,10 +63,130 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from signal_discovery_workflow.operator_cache import OperatorCache, memoize_operator
+
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent / "data" / "sp500"
 CALCULATOR_PATH = Path(__file__).parent / "template" / "calculator.json"
+
+# --- Optional integrations (both OFF by default: legacy behaviour unchanged) ---
+
+#: Route ``execute_signal_code`` through the tested sandbox (``sandbox.py``).
+#: Default OFF: when disabled, the legacy in-process ``exec`` path runs exactly
+#: as before. Override at call time via env var ``SIGNAL_SANDBOX_ENABLED``.
+SANDBOX_ENABLED: bool = False
+
+#: Delegate ``compute_rank_ic`` to ``gpu_backend.compute_rank_ic_gpu``.
+#: Default OFF: the returned dict keeps its exact legacy shape (no ``"backend"``
+#: key). Override at call time via env var ``SIGNAL_USE_GPU``.
+USE_GPU_BACKEND: bool = False
+
+#: Backend selector passed to ``compute_rank_ic_gpu`` when GPU delegation is
+#: enabled (``"auto"``, ``"cupy"``, ``"torch"`` or ``"cpu"``). Override at call
+#: time via env var ``SIGNAL_GPU_BACKEND``.
+GPU_BACKEND: str = "auto"
+
+#: Guards against infinite recursion: ``gpu_backend``'s CPU path imports this
+#: module's ``compute_rank_ic``, so the nested call must not delegate again.
+#: Evaluation is single-threaded here; under concurrent calls this can only
+#: skip GPU acceleration (never produce wrong results).
+_GPU_DELEGATION_ACTIVE = False
+
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean env-var override at call time (unset → ``default``)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _sandbox_enabled() -> bool:
+    """Whether sandboxed signal execution is enabled (env override wins)."""
+    return _env_flag("SIGNAL_SANDBOX_ENABLED", SANDBOX_ENABLED)
+
+
+def _gpu_enabled() -> bool:
+    """Whether GPU rank-IC delegation is enabled (env override wins)."""
+    return _env_flag("SIGNAL_USE_GPU", USE_GPU_BACKEND)
+
+
+def _gpu_backend_name() -> str:
+    """Backend selector for ``compute_rank_ic_gpu`` (env override wins)."""
+    return os.environ.get("SIGNAL_GPU_BACKEND", GPU_BACKEND).strip().lower() or GPU_BACKEND
+
+
+#: Memoize operator computations across candidate signal modules
+#: (``operator_cache``). Default OFF: with the flag off the candidate namespace
+#: is not touched at all. Override at call time via
+#: ``SIGNAL_USE_OPERATOR_CACHE``.
+USE_OPERATOR_CACHE: bool = False
+
+#: Maximum number of entries in the shared operator cache. Env override
+#: ``SIGNAL_OPERATOR_CACHE_MAX_ENTRIES`` (int; a bad value falls back to the
+#: default).
+OPERATOR_CACHE_MAX_ENTRIES: int = 512
+
+
+def _operator_cache_enabled() -> bool:
+    """Whether operator-result caching is enabled (env override wins)."""
+    return _env_flag("SIGNAL_USE_OPERATOR_CACHE", USE_OPERATOR_CACHE)
+
+
+def _operator_cache_max_entries() -> int:
+    """Max entries for the operator cache (env override; bad value → default)."""
+    raw = os.environ.get("SIGNAL_OPERATOR_CACHE_MAX_ENTRIES")
+    if raw is None:
+        return OPERATOR_CACHE_MAX_ENTRIES
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            f"Invalid SIGNAL_OPERATOR_CACHE_MAX_ENTRIES={raw!r}; "
+            f"using default {OPERATOR_CACHE_MAX_ENTRIES}"
+        )
+        return OPERATOR_CACHE_MAX_ENTRIES
+    if value <= 0:
+        logger.warning(
+            f"Invalid SIGNAL_OPERATOR_CACHE_MAX_ENTRIES={raw!r}; "
+            f"using default {OPERATOR_CACHE_MAX_ENTRIES}"
+        )
+        return OPERATOR_CACHE_MAX_ENTRIES
+    return value
+
+
+#: Shared operator-result cache for all candidate signal modules of a run.
+_OPERATOR_CACHE = OperatorCache(max_entries=_operator_cache_max_entries())
+
+
+def clear_operator_cache() -> None:
+    """Reset the shared operator cache (drops entries and hit/miss counters)."""
+    _OPERATOR_CACHE.clear()
+
+
+def _install_wrapped_operators(namespace: dict[str, Any]) -> None:
+    """
+    Wrap operator callables in ``namespace`` IN PLACE with memoized versions.
+
+    The signal functions' ``__globals__`` IS this namespace dict, so replacing
+    the operator entries in place makes the already-created signal functions
+    call the memoized wrappers. (``operator_cache.install_cached_operators``
+    returns a NEW dict and therefore cannot be used here.) Only names present
+    in ``OPERATOR_NAMES`` that are callables are wrapped — signal functions,
+    helpers, builtins and modules are left untouched. Wrappers use
+    ``copy_on_return=True`` so a cached result is handed out as a shallow
+    copy; the implementation fingerprint inside the cache key keeps different
+    operators that share a name from ever sharing an entry.
+    """
+    for name, obj in list(namespace.items()):
+        if name not in OPERATOR_NAMES or not callable(obj):
+            continue
+        if getattr(obj, "_operator_cache_wrapped", False):
+            continue  # already wrapped (idempotency guard from operator_cache)
+        namespace[name] = memoize_operator(obj, _OPERATOR_CACHE, copy_on_return=True)
 
 
 def _load_all_operators() -> dict[str, callable]:
@@ -106,22 +256,140 @@ def load_stock_data() -> dict[str, pd.DataFrame]:
         else:
             logger.warning(f"Data file not found: {file_path}")
 
+    # Market data (re)loaded: reset the operator cache to bound memory. The
+    # content fingerprints in the cache keys already prevent stale hits.
+    _OPERATOR_CACHE.clear()
     return data
+
+
+# Module-level forward-returns cache. Keyed by (periods, labels, shape,
+# content fingerprint); values are the computed forward-return frames.
+_forward_returns_cache: dict[tuple, pd.DataFrame] = {}
+
+
+def _close_fingerprint(close: pd.DataFrame) -> float:
+    """
+    Cheap probabilistic fingerprint of a frame's content.
+
+    Samples ~64 values evenly spaced through the flattened value array (all
+    values for small frames) and returns their sum. This is a cheap
+    *probabilistic* fingerprint, not a cryptographic hash: two different
+    datasets could theoretically produce the same fingerprint, though the
+    probability is negligible for real price data. The trade-off is
+    deliberate — key construction stays O(rows + cols) sampling instead of a
+    full O(n) hash of every value.
+    """
+    values = np.nan_to_num(close.to_numpy()).ravel()
+    stride = max(1, values.size // 64)
+    return float(values[::stride].sum())
+
+
+def _forward_returns_cache_key(close: pd.DataFrame, periods: int) -> tuple:
+    """
+    Deterministic, cheap cache key for a forward-returns computation.
+
+    Combines the horizon, the frame's index/column labels, its shape, and the
+    content fingerprint. The fingerprint guards against two different datasets
+    with identical labels/shape silently sharing a cache entry. Full values are
+    never hashed, so key construction is O(rows + cols).
+    """
+    return (
+        periods,
+        close.shape,
+        tuple(close.index.tolist()),
+        tuple(close.columns.tolist()),
+        _close_fingerprint(close),
+    )
+
+
+def _get_cached_forward_returns(close: pd.DataFrame, periods: int) -> pd.DataFrame:
+    """
+    Compute (or fetch from cache) forward returns ``close.shift(-periods) / close - 1``.
+
+    On a cache hit the stored frame is returned as-is; on a miss the frame is
+    computed, stored, and returned. Callers must not mutate the returned frame,
+    since it may be shared across calls.
+    """
+    key = _forward_returns_cache_key(close, periods)
+    cached = _forward_returns_cache.get(key)
+    if cached is not None:
+        logger.debug(f"Forward-returns cache HIT (periods={periods})")
+        return cached
+    logger.debug(f"Forward-returns cache MISS (periods={periods})")
+    forward_returns = close.shift(-periods) / close - 1
+    _forward_returns_cache[key] = forward_returns
+    return forward_returns
+
+
+def clear_forward_returns_cache() -> None:
+    """Reset the module-level forward-returns cache.
+
+    Needed by tests and by long-running processes that process many distinct
+    datasets and must not accumulate cached frames indefinitely.
+    """
+    _forward_returns_cache.clear()
 
 
 def compute_forward_returns(close: pd.DataFrame, periods: int = 5) -> pd.DataFrame:
     """
     Compute forward returns for the next N periods.
 
+    Results are served from a module-level cache keyed on the horizon, index,
+    columns, shape, and a cheap content fingerprint, so repeated calls with
+    the same data reuse one precomputed frame.
+
     Args:
         close: DataFrame of closing prices (rows=dates, cols=stocks).
         periods: Number of forward periods for return calculation.
 
     Returns:
-        DataFrame of forward returns with the same shape as input.
+        DataFrame of forward returns with the same shape as input. Callers
+        must not mutate the returned frame — it may be shared with other
+        callers; use ``clear_forward_returns_cache()`` to reset the cache.
     """
-    forward_returns = close.shift(-periods) / close - 1
-    return forward_returns
+    return _get_cached_forward_returns(close, periods)
+
+
+def compute_signal_turnover(
+    signal_values: pd.DataFrame,
+    periods_per_year: int = 252,
+) -> float:
+    """
+    Compute the annualized cross-sectional percentile-rank turnover of a signal.
+
+    For each date, every stock's signal value is ranked cross-sectionally into
+    [0, 1] (percentile rank). Per-date turnover is the mean absolute change of
+    those percentile ranks versus the previous date, averaged across stocks:
+
+        turnover[t] = mean_i( |rank[t, i] - rank[t - 1, i]| )
+
+    The returned value is the mean per-period turnover annualized by
+    ``periods_per_year``:
+
+        annualized_turnover = mean_t( turnover[t] ) * periods_per_year
+
+    Args:
+        signal_values: DataFrame of signal values (rows=dates, cols=stocks).
+        periods_per_year: Number of trading periods per year used to annualize
+            (default 252 for daily data).
+
+    Returns:
+        Annualized turnover as a float. Returns 0.0 for empty input or when
+        fewer than two usable dates exist (turnover requires a previous date).
+    """
+    if not isinstance(signal_values, pd.DataFrame):
+        return 0.0
+    if signal_values.empty or len(signal_values) < 2:
+        return 0.0
+
+    pct_ranks = signal_values.rank(axis=1, pct=True)
+    rank_changes = pct_ranks.diff().abs()
+    # The first date has no previous rank (NaN diff) and is dropped by mean().
+    per_period_turnover = rank_changes.mean(axis=1).dropna()
+    if per_period_turnover.empty:
+        return 0.0
+
+    return float(per_period_turnover.mean() * periods_per_year)
 
 
 def compute_rank_ic(
@@ -140,7 +408,34 @@ def compute_rank_ic(
 
     Returns:
         Dictionary containing IC statistics.
+
+    GPU delegation:
+        When enabled (``USE_GPU_BACKEND`` or env ``SIGNAL_USE_GPU``), the
+        computation is delegated to ``gpu_backend.compute_rank_ic_gpu`` and the
+        result additionally carries a ``"backend"`` key. When disabled (the
+        default) the returned dict is exactly the legacy CPU result — no
+        ``"backend"`` key, byte-identical values. Any GPU failure (including a
+        missing/broken backend) is logged at WARNING and falls back to the CPU
+        implementation below.
     """
+    global _GPU_DELEGATION_ACTIVE
+    if _gpu_enabled() and not _GPU_DELEGATION_ACTIVE:
+        # gpu_backend's CPU path imports this module's compute_rank_ic, so the
+        # delegation guard above prevents infinite recursion when it calls
+        # back into us. Lazily imported: gpu_backend imports this module, and
+        # an eager import here would create a circular import.
+        _GPU_DELEGATION_ACTIVE = True
+        try:
+            from signal_discovery_workflow.gpu_backend import compute_rank_ic_gpu
+
+            return compute_rank_ic_gpu(
+                signal_values, forward_returns, backend=_gpu_backend_name()
+            )
+        except Exception as e:
+            logger.warning(f"GPU rank-IC failed ({type(e).__name__}); falling back to CPU: {e}")
+        finally:
+            _GPU_DELEGATION_ACTIVE = False
+
     common_dates = signal_values.index.intersection(forward_returns.index)
     common_stocks = signal_values.columns.intersection(forward_returns.columns)
 
@@ -227,6 +522,74 @@ def compute_rank_ic(
                 "95th": float(np.percentile(ic_array, 95)),
             },
         }
+
+
+def evaluate_signal(
+    signal_values: pd.DataFrame,
+    forward_returns: pd.DataFrame,
+    periods_per_year: int = 252,
+) -> dict[str, Any]:
+    """
+    Full evaluation of a signal: rank-IC statistics, turnover, and portfolio metrics.
+
+    Combines:
+      - the full rank-IC statistics from :func:`compute_rank_ic`;
+      - annualized turnover from :func:`compute_signal_turnover` (key
+        ``"turnover"``);
+      - portfolio metrics from the sibling ``quant_metrics`` module, when that
+        module is importable and functional. The import happens lazily inside
+        this function: on ImportError the portfolio keys are simply omitted —
+        evaluation never hard-depends on the module. Even when the module
+        exists, the calls are wrapped defensively: a partial or buggy
+        implementation can never break the core evaluation, but any such
+        integration failure is logged at WARNING so it cannot pass unnoticed.
+        Portfolio keys are additive only: rank-IC keys (including
+        ``num_periods``, which counts IC periods) are never overwritten by
+        same-named portfolio metrics.
+
+    Args:
+        signal_values: DataFrame of signal values (rows=dates, cols=stocks).
+        forward_returns: DataFrame of forward returns (rows=dates, cols=stocks).
+        periods_per_year: Periods per year used to annualize turnover and
+            portfolio metrics (default 252 for daily data).
+
+    Returns:
+        Dict with all rank-IC statistics, ``"turnover"``, and (when
+        ``quant_metrics`` is available) its portfolio metric keys such as
+        ``sharpe_ratio``, ``sortino_ratio``, ``max_drawdown``.
+    """
+    result: dict[str, Any] = dict(compute_rank_ic(signal_values, forward_returns))
+    result["turnover"] = compute_signal_turnover(
+        signal_values, periods_per_year=periods_per_year
+    )
+
+    try:
+        from signal_discovery_workflow.quant_metrics import (  # noqa: PLC0415
+            build_portfolio_weights,
+            compute_portfolio_metrics,
+            portfolio_returns_from_weights,
+        )
+    except ImportError as e:
+        logger.debug(f"quant_metrics not available; skipping portfolio metrics: {e}")
+    else:
+        try:
+            weights = build_portfolio_weights(
+                signal_values, top_quantile=0.2, bottom_quantile=0.2
+            )
+            portfolio_returns = portfolio_returns_from_weights(weights, forward_returns)
+            portfolio_metrics = compute_portfolio_metrics(
+                portfolio_returns, periods_per_year=periods_per_year
+            )
+            if isinstance(portfolio_metrics, dict):
+                # Additive merge: never clobber rank-IC statistics with
+                # same-named portfolio keys (e.g. "num_periods").
+                result.update(
+                    {k: v for k, v in portfolio_metrics.items() if k not in result}
+                )
+        except Exception as e:
+            logger.warning(f"Portfolio metrics unavailable; evaluate_signal returned partial results: {e}")
+
+    return result
 
 
 def extract_code_from_response(code_response: str) -> str:
@@ -364,9 +727,35 @@ def execute_signal_code(
     ``selection_periods`` controls the forward-return horizon used to choose
     the best signal when multiple signal functions are present.
 
+    Sandboxing:
+        When enabled (``SANDBOX_ENABLED`` or env ``SIGNAL_SANDBOX_ENABLED``),
+        execution is delegated to ``sandbox.execute_signal_code_sandboxed``
+        (same contract, no side effects from untrusted code). Any sandbox
+        failure is logged at WARNING and yields None; a missing sandbox module
+        falls back to the legacy path below. When disabled (the default), the
+        legacy in-process path runs exactly as before.
+
     Returns the (signal_values, selected_signal_name) tuple of the highest-IC
     signal among those defined in ``code``, or None on failure.
     """
+    if _sandbox_enabled():
+        try:
+            from signal_discovery_workflow.sandbox import execute_signal_code_sandboxed
+        except ImportError as e:
+            logger.warning(f"sandbox module unavailable ({type(e).__name__}); falling back to legacy execution: {e}")
+        else:
+            try:
+                logger.info(
+                    "Executing signal code in sandbox "
+                    "(allow_subprocess=False: in-process restrictions active, subprocess isolation off)"
+                )
+                return execute_signal_code_sandboxed(
+                    code, stock_data, selection_periods=selection_periods
+                )
+            except Exception as e:
+                logger.warning(f"Sandboxed signal execution failed ({type(e).__name__}); returning None")
+                return None
+
     namespace: dict[str, Any] = {}
 
     try:
@@ -398,6 +787,14 @@ def execute_signal_code(
             f"{[f[0] for f in signal_functions]}"
             + (f" (skipping helpers: {sorted(helpers)})" if helpers else "")
         )
+
+        if _operator_cache_enabled():
+            # Wrap operator callables IN PLACE so the signal functions'
+            # __globals__ (this namespace) resolve to the memoized wrappers.
+            # Reached by the legacy path only: the sandbox delegation above
+            # returns before this and runs code in its own restricted
+            # namespace, which does not share this cache.
+            _install_wrapped_operators(namespace)
 
         best_result = None
         best_ic = None
@@ -432,8 +829,10 @@ def execute_signal_code(
                         result = result.to_frame()
 
                     if isinstance(result, pd.DataFrame):
-                        forward_ret = (
-                            stock_data["Close"].shift(-selection_periods) / stock_data["Close"] - 1
+                        # Cached so multiple candidate signals in one module
+                        # reuse the same forward-return frame.
+                        forward_ret = _get_cached_forward_returns(
+                            stock_data["Close"], selection_periods
                         )
                         valid_dates = result.dropna(how="all").index
                         sample_ics = []

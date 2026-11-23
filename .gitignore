@@ -7,6 +7,10 @@ result*.json
 .venv/
 .vscode/
 src/signal_discovery_workflow/data/sp500/*.csv
+src/signal_discovery_workflow/data/binance_futures/*.csv
+
+# Jupyter auto-saved checkpoints
+notebooks/.ipynb_checkpoints/
 
 # Secrets — never commit API keys.
 .env
