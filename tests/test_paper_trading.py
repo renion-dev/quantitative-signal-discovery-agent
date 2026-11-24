@@ -15,16 +15,20 @@
 
 """Tests for paper-trading configuration, balance, sizing, and candidate selection."""
 
+import math
+
 import pytest
 
 from signal_discovery_workflow.paper_trading import (
     PaperConfig,
     PaperConfigError,
+    account_summary,
     classify_consensus_regime,
     classify_sma_regime,
     combine_regimes,
     free_balance,
     load_paper_config,
+    open_notional,
     position_notional_cap,
     regime_alignment,
     select_open_candidates,
@@ -204,6 +208,207 @@ class TestFreeBalance:
         }
 
         assert free_balance(config, state) == pytest.approx(10000.0)
+
+
+class TestAccountSummary:
+    """The account-summary payload consumed by the dashboard balance UI."""
+
+    #: The exact key set promised to the dashboard for the ``balance`` payload.
+    DOCUMENTED_KEYS = {
+        "starting_balance",
+        "realized_pnl",
+        "open_notional",
+        "free_balance",
+        "equity",
+        "open_positions",
+        "long_positions",
+        "short_positions",
+        "total_pnl",
+    }
+
+    def test_starting_balance_only(self):
+        config = PaperConfig(starting_balance=10000.0)
+
+        summary = account_summary(config, {})
+
+        assert summary == {
+            "starting_balance": 10000.0,
+            "realized_pnl": 0.0,
+            "open_notional": 0.0,
+            "free_balance": 10000.0,
+            "equity": 10000.0,
+            "open_positions": 0,
+            "long_positions": 0,
+            "short_positions": 0,
+            "total_pnl": 0.0,
+        }
+
+    def test_realized_pnl_is_included_in_equity_and_free_balance(self):
+        config = PaperConfig(starting_balance=10000.0)
+        state = {"cumulative_closed_pnl": 125.5}
+
+        summary = account_summary(config, state)
+
+        assert summary["realized_pnl"] == pytest.approx(125.5)
+        assert summary["equity"] == pytest.approx(10125.5)
+        assert summary["free_balance"] == pytest.approx(10125.5)
+        assert summary["open_positions"] == 0
+        assert summary["total_pnl"] == pytest.approx(0.0)
+
+    def test_open_positions_tie_up_capital_but_do_not_change_equity(self):
+        config = PaperConfig(starting_balance=10000.0)
+        state = {
+            "cumulative_closed_pnl": -50.0,
+            "positions": [
+                {"symbol": "BTCUSDT", "side": "long", "entry": 100.0, "qty": 2.0, "pnl": 12.5},
+                {"symbol": "ETHUSDT", "side": "short", "entry": 50.0, "qty": 1.0, "pnl": -3.25},
+            ],
+        }
+
+        summary = account_summary(config, state)
+
+        assert summary["open_notional"] == pytest.approx(250.0)
+        assert summary["free_balance"] == pytest.approx(10000.0 - 50.0 - 250.0)
+        assert summary["equity"] == pytest.approx(9950.0)
+        assert summary["equity"] == pytest.approx(summary["free_balance"] + summary["open_notional"])
+        assert summary["open_positions"] == 2
+        assert summary["long_positions"] == 1
+        assert summary["short_positions"] == 1
+        assert summary["total_pnl"] == pytest.approx(12.5 - 3.25)
+
+    def test_free_balance_field_matches_the_free_balance_function(self):
+        """The reported free balance must be identical to free_balance(config, state)."""
+
+        config = PaperConfig(starting_balance=7500.0, max_position_size_pct=25.0)
+        states = [
+            {},
+            {"cumulative_closed_pnl": 300.0},
+            {"positions": [{"entry": 12.5, "qty": 3.0}]},
+            {
+                "cumulative_closed_pnl": -120.5,
+                "positions": [
+                    {"symbol": "A", "side": "long", "entry": 10.0, "qty": 2.0},
+                    {"symbol": "B", "side": "short", "entry": 4.0, "qty": 0.5},
+                ],
+            },
+        ]
+
+        for state in states:
+            assert account_summary(config, state)["free_balance"] == free_balance(config, state)
+
+    def test_legacy_partial_state_is_tolerated(self):
+        config = PaperConfig(starting_balance=8000.0)
+
+        for state in (None, {}, {"positions": []}, {"cumulative_closed_pnl": None}):
+            summary = account_summary(config, state)
+
+            assert summary["starting_balance"] == pytest.approx(8000.0)
+            assert summary["realized_pnl"] == pytest.approx(0.0)
+            assert summary["open_notional"] == pytest.approx(0.0)
+            assert summary["free_balance"] == pytest.approx(8000.0)
+            assert summary["equity"] == pytest.approx(8000.0)
+            assert summary["open_positions"] == 0
+            assert summary["total_pnl"] == pytest.approx(0.0)
+
+    def test_junk_values_are_ignored(self):
+        config = PaperConfig(starting_balance=10000.0)
+        state = {
+            "cumulative_closed_pnl": "not-a-number",
+            "positions": [
+                {"symbol": "BAD", "side": "long", "entry": "bad", "qty": 1.0, "pnl": "junk"},
+                {"symbol": "ALSO_BAD", "side": "short", "entry": 10.0, "qty": None, "pnl": None},
+                {"symbol": "NAN", "side": "long", "entry": float("nan"), "qty": 1.0},
+                "not-a-position",
+            ],
+        }
+
+        summary = account_summary(config, state)
+
+        assert summary["realized_pnl"] == pytest.approx(0.0)
+        assert summary["open_notional"] == pytest.approx(0.0)
+        assert summary["free_balance"] == pytest.approx(10000.0)
+        assert summary["equity"] == pytest.approx(10000.0)
+        assert summary["open_positions"] == 3
+        assert summary["long_positions"] == 2
+        assert summary["short_positions"] == 1
+        assert summary["total_pnl"] == pytest.approx(0.0)
+
+    def test_all_monetary_values_are_finite_floats_and_counts_are_integers(self):
+        config = PaperConfig(starting_balance=10000.0)
+        state = {
+            "cumulative_closed_pnl": 42.0,
+            "positions": [{"side": "long", "entry": 100.0, "qty": 1.0, "pnl": 5.0}],
+        }
+
+        summary = account_summary(config, state)
+
+        for key in (
+            "starting_balance",
+            "realized_pnl",
+            "open_notional",
+            "free_balance",
+            "equity",
+            "total_pnl",
+        ):
+            assert isinstance(summary[key], float), key
+            assert math.isfinite(summary[key]), key
+        for key in ("open_positions", "long_positions", "short_positions"):
+            assert isinstance(summary[key], int), key
+
+    def test_balance_payload_keys_are_exactly_the_documented_set(self):
+        config = PaperConfig(starting_balance=10000.0)
+
+        assert set(account_summary(config, {})) == self.DOCUMENTED_KEYS
+        assert set(account_summary(config, None)) == self.DOCUMENTED_KEYS
+        assert set(
+            account_summary(
+                config,
+                {"cumulative_closed_pnl": 1.0, "positions": [{"side": "short", "entry": 5.0, "qty": 1.0}]},
+            )
+        ) == self.DOCUMENTED_KEYS
+
+    def test_negative_quantities_use_the_absolute_notional(self):
+        config = PaperConfig(starting_balance=1000.0)
+        state = {"positions": [{"symbol": "X", "side": "short", "entry": 10.0, "qty": -2.0}]}
+
+        assert open_notional(state) == pytest.approx(20.0)
+        assert account_summary(config, state)["free_balance"] == pytest.approx(980.0)
+
+
+class TestOpenNotionalHelper:
+    """The reusable open-notional helper extracted from free_balance."""
+
+    def test_sums_abs_qty_times_entry_and_ignores_junk(self):
+        state = {
+            "positions": [
+                {"symbol": "BTCUSDT", "entry": 100.0, "qty": 2.0},
+                {"symbol": "ETHUSDT", "entry": 50.0, "qty": 1.5},
+                {"symbol": "BAD", "entry": "junk", "qty": 1.0},
+                {"symbol": "NAN", "entry": float("nan"), "qty": 1.0},
+                "not-a-position",
+            ]
+        }
+
+        assert open_notional(state) == pytest.approx(275.0)
+
+    def test_matches_the_deduction_applied_inside_free_balance(self):
+        state = {
+            "cumulative_closed_pnl": 25.0,
+            "positions": [
+                {"symbol": "A", "entry": 10.0, "qty": 2.0},
+                {"symbol": "B", "entry": 4.0, "qty": 0.5},
+            ],
+        }
+        config = PaperConfig(starting_balance=1000.0)
+
+        assert open_notional(state) == pytest.approx(22.0)
+        assert config.starting_balance + 25.0 - open_notional(state) == free_balance(config, state)
+
+    def test_missing_and_malformed_state_yield_zero(self):
+        assert open_notional(None) == pytest.approx(0.0)
+        assert open_notional({}) == pytest.approx(0.0)
+        assert open_notional({"positions": None}) == pytest.approx(0.0)
+        assert open_notional({"positions": "not-a-list"}) == pytest.approx(0.0)
 
 
 class TestPositionNotionalCap:

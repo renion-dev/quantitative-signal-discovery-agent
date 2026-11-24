@@ -254,6 +254,10 @@ async function refresh(){
   const lastOpen=window._paperOpenResult||{};
   const skipped=Array.isArray(lastOpen.skipped)?lastOpen.skipped:[];
   const sideCounts=paper.side_counts||{};
+  // Live account balance (server-computed account_summary). Falls back to a neutral placeholder
+  // when the balance payload is missing so the panel never shows undefined/NaN.
+  const balance=paper.balance||{};
+  const balText=v=>(v===null||v===undefined||!isFinite(Number(v)))?'—':Number(v).toFixed(4);
   const perSide=(limits.max_positions_per_side===null||limits.max_positions_per_side===undefined)?'—':limits.max_positions_per_side;
   const regimeInfo=lastOpen.regime||paper.regime||null;
   const regimeOn=!!(regimeInfo&&regimeInfo.enabled!==false);
@@ -263,6 +267,10 @@ async function refresh(){
   const configError=paper.config_error?`CONFIG ERROR: ${esc(paper.error||'invalid paper-trading config')}`:'';
   pel.innerHTML=`<div class="mb-2 p-2 border border-gray-700 rounded">
     <div>Open positions: <span class="font-bold text-cyan-300">${esc(openCount)}</span> / ${esc(maxOpen)}</div>
+    <div class="mt-1">Free balance: <span class="font-bold text-cyan-300">${esc(balText(balance.free_balance))} USDT</span> <span class="text-gray-500 text-xs">cash available for new positions</span></div>
+    <div class="text-gray-400 mt-1">Equity: <span class="text-cyan-300">${esc(balText(balance.equity))} USDT</span> <span class="text-gray-500 text-xs">starting balance + realised PnL</span></div>
+    <div class="text-gray-400 mt-1">Open notional: <span class="text-gray-300">${esc(balText(balance.open_notional))} USDT</span> <span class="text-gray-500 text-xs">tied up in open positions</span></div>
+    <div class="text-gray-400 mt-1">Realised PnL: <span class="${esc((balance.realized_pnl||0)>=0?'text-green-400':'text-red-400')} font-bold">${esc(balText(balance.realized_pnl))} USDT</span></div>
     <div class="text-gray-400 mt-1">Starting balance: ${esc(starting)} USDT</div>
     <div class="text-gray-400 mt-1">Max per position: ${esc(perPosition)}</div>
     <div class="text-gray-400 mt-1">Side cap: ${esc(sideCounts.long||0)} long · ${esc(sideCounts.short||0)} short (max ${esc(perSide)} per side)</div>
