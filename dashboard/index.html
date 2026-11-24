@@ -156,6 +156,16 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
         </div>
       </div>
       <div class="col-span-4 flex flex-col gap-3 overflow-auto">
+        <div class="rounded-xl border border-cyan-900/40 bg-gray-900/60 p-3">
+          <div class="text-xs text-gray-400 tracking-widest mb-2">BALANCE</div>
+          <div class="text-xs text-gray-400">Free balance (USDT) <span class="text-gray-500">· cash for new positions</span></div>
+          <div id="kpi_free" class="text-2xl font-bold text-cyan-300">—</div>
+          <div class="grid grid-cols-2 gap-3 mt-2">
+            <div><div class="text-xs text-gray-400">Equity (USDT)</div><div id="kpi_equity" class="text-lg font-bold text-cyan-300">—</div></div>
+            <div><div class="text-xs text-gray-400">Open notional (USDT)</div><div id="kpi_notional" class="text-lg font-bold text-gray-300">—</div></div>
+            <div class="col-span-2"><div class="text-xs text-gray-400">Realised PnL (USDT)</div><div id="kpi_realized" class="text-lg font-bold text-green-400">—</div></div>
+          </div>
+        </div>
         <div class="grid grid-cols-2 gap-3">
           <div class="rounded-xl border border-gray-800 bg-gray-900/60 p-3"><div class="text-xs text-gray-400">Total PnL</div><div id="kpi_pnl" class="text-xl font-bold">—</div></div>
           <div class="rounded-xl border border-gray-800 bg-gray-900/50 p-3"><div class="text-xs text-gray-400">Open</div><div id="kpi_n" class="text-xl font-bold">—</div></div>
@@ -203,6 +213,22 @@ function clock(){document.getElementById('clock').textContent=new Date().toLocal
 setInterval(clock,1000);clock();
 function showTab(t,el){document.querySelectorAll('section').forEach(s=>s.classList.add('hidden'));document.getElementById('tab-'+t).classList.remove('hidden');document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));el.classList.add('active'); if(t==='portfolio') renderPortfolio(); if(t==='evolution') renderEvolution();}
 function fmtP(n,ref){const d=(String(ref).split('.')[1]||'').length;return Number(n).toFixed(Math.min(d+1,8));}
+// Shared money formatter for the live paper-account balance: null/undefined/non-finite
+// render as a neutral placeholder instead of undefined/NaN.
+const balText=v=>(v===null||v===undefined||!isFinite(Number(v)))?'—':Number(v).toFixed(4);
+// Live paper-account balance tiles shown in the PORTFOLIO tab. Free balance is the cash
+// available for new positions, equity is starting balance + realised PnL, open notional is
+// the capital tied up in open positions.
+function setBalanceTiles(bal){
+  bal=bal||{};
+  const set=(id,v)=>{const el=document.getElementById(id);if(el)el.textContent=balText(v);};
+  set('kpi_free',bal.free_balance);
+  set('kpi_equity',bal.equity);
+  set('kpi_notional',bal.open_notional);
+  set('kpi_realized',bal.realized_pnl);
+  const rp=document.getElementById('kpi_realized');
+  if(rp){const v=Number(bal.realized_pnl);rp.className='text-lg font-bold '+(isFinite(v)&&v<0?'text-red-400':'text-green-400');}
+}
 function preset(v){document.getElementById('inp').value=v}
 async function refresh(){
   const s=await fetch('/api/status').then(r=>r.json());
@@ -241,6 +267,8 @@ async function refresh(){
   const cons=await fetch('/api/consensus').then(r=>r.json());
   const prices=await fetch('/api/prices').then(r=>r.json()).catch(()=>({}));
   const paper=await fetch('/api/paper/status').then(r=>r.json()).catch(()=>({}));
+  // Keep the PORTFOLIO balance tiles live (they are the account's headline numbers).
+  setBalanceTiles(paper.balance||{});
   const pel=document.getElementById('paper');
   const paperPositions=Array.isArray(paper.positions)?paper.positions:[];
   const limits=paper.limits||{};
@@ -257,7 +285,6 @@ async function refresh(){
   // Live account balance (server-computed account_summary). Falls back to a neutral placeholder
   // when the balance payload is missing so the panel never shows undefined/NaN.
   const balance=paper.balance||{};
-  const balText=v=>(v===null||v===undefined||!isFinite(Number(v)))?'—':Number(v).toFixed(4);
   const perSide=(limits.max_positions_per_side===null||limits.max_positions_per_side===undefined)?'—':limits.max_positions_per_side;
   const regimeInfo=lastOpen.regime||paper.regime||null;
   const regimeOn=!!(regimeInfo&&regimeInfo.enabled!==false);
@@ -369,6 +396,8 @@ async function renderPortfolio(){
   if(!canvas) return;
   // fetch status + render positions FIRST (independent of history)
   const st=await fetch('/api/paper/status').then(r=>r.json()).catch(()=>({}));
+  // The account balance is the headline of this tab — fill it from the status payload.
+  setBalanceTiles(st.balance||{});
   const pel=document.getElementById('port_positions');
   if(pel){
     if(st.positions&&st.positions.length){
