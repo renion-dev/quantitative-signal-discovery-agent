@@ -347,7 +347,9 @@ except ImportError:  # pragma: no cover - Linux is the supported runtime
     _fcntl=None
 
 from signal_discovery_workflow.paper_trading import (
+    PaperConfig,
     PaperConfigError,
+    account_summary,
     classify_consensus_regime,
     classify_sma_regime,
     combine_regimes,
@@ -581,8 +583,14 @@ def paper_status():
     response["regime"]=d.get("last_regime")
     if config is not None:
         response["limits"]=_paper_limits(config)
+        response["balance"]=account_summary(config,d)
     else:
         response["limits"]=None; response["config_error"]=True; response["error"]=config_error
+        # Invalid config still reports a usable balance so the UI shows money instead of blanks:
+        # the DEFAULT starting balance is assumed (PaperConfig() -> 10000.0), while realized PnL,
+        # open notional and position counts keep their state-derived values. The config_error flag
+        # stays in the response, so the UI marks the numbers as coming from a broken config.
+        response["balance"]=account_summary(PaperConfig(),d)
     return JSONResponse(response)
 
 @app.post("/api/paper/open")
@@ -620,6 +628,7 @@ def paper_open():
                 "note":"no desired signals, positions kept",
                 "limits":_paper_limits(config),"skipped":[],
                 "regime":regime_info,"side_counts":side_counts(paper["positions"]),
+                "balance":account_summary(config,paper),
             })
         selected,skipped=select_open_candidates(
             desired,paper["positions"],prices,config,paper_state=paper,base_qty=1.0,
@@ -649,6 +658,7 @@ def paper_open():
         "opened":len(opened),"closed":0,"positions":paper["positions"],
         "limits":_paper_limits(config),"skipped":skipped,
         "regime":regime_info,"side_counts":side_counts(paper["positions"]),
+        "balance":account_summary(config,paper),
     })
 
 @app.post("/api/paper/close")

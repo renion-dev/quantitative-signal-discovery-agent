@@ -350,6 +350,31 @@ def _finite_number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def open_notional(paper_state: Mapping[str, Any] | None) -> float:
+    """Calculate the capital currently tied up in the open positions.
+
+    The notional is the sum of ``abs(qty * entry)`` across the open positions in ``paper_state``.
+    Missing, malformed, and non-numeric state values are ignored; the result is always a finite
+    float.
+    """
+
+    notional = 0.0
+    if isinstance(paper_state, Mapping):
+        positions = paper_state.get("positions", [])
+        if isinstance(positions, Sequence) and not isinstance(positions, (str, bytes)):
+            for position in positions:
+                if not isinstance(position, Mapping):
+                    continue
+                quantity = _finite_number(position.get("qty"))
+                entry = _finite_number(position.get("entry"))
+                if quantity is None or entry is None:
+                    continue
+                amount = abs(quantity * entry)
+                if math.isfinite(amount):
+                    notional += amount
+    return notional
+
+
 def free_balance(config: PaperConfig, paper_state: Mapping[str, Any] | None) -> float:
     """Calculate the paper account's free balance.
 
@@ -362,22 +387,77 @@ def free_balance(config: PaperConfig, paper_state: Mapping[str, Any] | None) -> 
     if isinstance(paper_state, Mapping):
         realized_pnl = _finite_number(paper_state.get("cumulative_closed_pnl", 0.0)) or 0.0
 
-    open_notional = 0.0
-    if isinstance(paper_state, Mapping):
-        positions = paper_state.get("positions", [])
-        if isinstance(positions, Sequence) and not isinstance(positions, (str, bytes)):
-            for position in positions:
-                if not isinstance(position, Mapping):
-                    continue
-                quantity = _finite_number(position.get("qty"))
-                entry = _finite_number(position.get("entry"))
-                if quantity is None or entry is None:
-                    continue
-                notional = abs(quantity * entry)
-                if math.isfinite(notional):
-                    open_notional += notional
+    return config.starting_balance + realized_pnl - open_notional(paper_state)
 
-    return config.starting_balance + realized_pnl - open_notional
+
+def account_summary(config: PaperConfig, paper_state: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Summarise the paper account's financial state for the dashboard balance UI.
+
+    Every monetary field is a finite float and the position counts are integers. Missing or
+    malformed state values are ignored, so a legacy or partial state never raises and never
+    produces ``NaN`` or infinity.
+
+    Returns:
+        A mapping with exactly these keys:
+
+        * ``starting_balance`` - the configured starting capital (``config.starting_balance``).
+        * ``realized_pnl`` - the cumulative PnL of closed trades (``cumulative_closed_pnl``);
+          ``0.0`` when absent or non-numeric.
+        * ``open_notional`` - the capital currently tied up in open positions, i.e. the sum of
+          ``abs(qty * entry)`` over them (see :func:`open_notional`).
+        * ``free_balance`` - the cash available for new positions:
+          ``starting_balance + realized_pnl - open_notional``. Identical to
+          :func:`free_balance` by construction.
+        * ``equity`` - what the account is worth right now:
+          ``starting_balance + realized_pnl``, equivalently ``free_balance + open_notional``.
+          Equity counts the capital still tied up in open positions, while ``free_balance`` is
+          only the uncommitted cash.
+        * ``open_positions`` - number of open position entries (malformed entries are ignored).
+        * ``long_positions`` / ``short_positions`` - open position counts per side (see
+          :func:`side_counts`); sides other than long/short are not counted here.
+        * ``total_pnl`` - the mark-to-market PnL of the OPEN positions only: the sum of the
+          per-position unrealised ``pnl`` values when the state carries them, else ``0.0``.
+          Realized PnL of closed trades is reported separately by ``realized_pnl`` and is not
+          part of this sum.
+    """
+
+    realized_pnl = 0.0
+    if isinstance(paper_state, Mapping):
+        realized_pnl = _finite_number(paper_state.get("cumulative_closed_pnl", 0.0)) or 0.0
+
+    starting_balance = float(config.starting_balance)
+    notional = open_notional(paper_state)
+    free = free_balance(config, paper_state)
+    equity = starting_balance + realized_pnl
+
+    positions: Sequence[Any] = []
+    if isinstance(paper_state, Mapping):
+        raw_positions = paper_state.get("positions", [])
+        if isinstance(raw_positions, Sequence) and not isinstance(raw_positions, (str, bytes)):
+            positions = raw_positions
+
+    counts = side_counts(positions)
+    open_positions = sum(1 for position in positions if isinstance(position, Mapping))
+
+    total_pnl = 0.0
+    for position in positions:
+        if not isinstance(position, Mapping):
+            continue
+        pnl = _finite_number(position.get("pnl"))
+        if pnl is not None:
+            total_pnl += pnl
+
+    return {
+        "starting_balance": starting_balance,
+        "realized_pnl": realized_pnl,
+        "open_notional": notional,
+        "free_balance": free,
+        "equity": equity,
+        "open_positions": open_positions,
+        "long_positions": counts["long"],
+        "short_positions": counts["short"],
+        "total_pnl": total_pnl,
+    }
 
 
 def position_notional_cap(config: PaperConfig, free_balance: float) -> float | None:
